@@ -1,0 +1,37 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — Virtual Memory Manager (kernel/vmem.tn)
+// ═══════════════════════════════════════════════════════════════
+//  x86_64 4-level paging.
+//  Phase 1: identity mapping (kernel lives in higher half).
+//  The HHDM offset from Limine lets us access physical memory
+//  at (phys + hhdm_offset) without touching CR3 on every access.
+// ═══════════════════════════════════════════════════════════════
+
+import "./pmem"
+
+static let g_hhdm_offset:int = 0
+static let g_pml4:int        = 0
+static let g_inited:int      = 0
+
+let PAGE_SIZE:int    = 4096
+let PAGE_PRESENT:int = 1
+let PAGE_WRITE:int   = 2
+let PAGE_USER:int    = 4
+
+fn init(hhdm_offset:int) -> int:
+  g_hhdm_offset = hhdm_offset
+  g_inited = 1
+  ret 0
+
+// Convert physical address to virtual (using HHDM)
+fn phys_to_virt(phys:int) -> int:
+  ret phys + g_hhdm_offset
+
+// Allocate a virtual page (phys + map)
+fn alloc_page(virt:int, flags:int) -> int:
+  phys:int = pmem.alloc()
+  if phys < 0: ret (0 - 1)
+  ret phys_to_virt(phys)
+
+fn hhdm_offset() -> int: ret g_hhdm_offset
+fn is_inited() -> int:   ret g_inited

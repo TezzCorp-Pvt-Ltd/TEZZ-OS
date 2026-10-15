@@ -1,0 +1,107 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — Kernel Heap Allocator (kernel/heap.tn)
+// ═══════════════════════════════════════════════════════════════
+//
+//  First-fit heap with coalescing free blocks.
+//  Used by kernel subsystems and shell command processing.
+//  Not thread-safe yet (single-core Phase 1).
+// ═══════════════════════════════════════════════════════════════
+
+struct HeapBlock:
+  magic:int        // 0xDEAD_BEEF = valid, 0xFREE_CAFE = free
+  size:int         // payload size in bytes
+  is_free:int
+  next:*HeapBlock
+
+let HEAP_MAGIC_USED:int = 0xDEADBEEF
+let HEAP_MAGIC_FREE:int = 0xFEEDCAFE
+let HEAP_ALIGN:int      = 16   // 16-byte alignment
+
+static let g_heap_head:*HeapBlock = 0 as *HeapBlock
+static let g_heap_base:int = 0
+static let g_heap_end:int  = 0
+static let g_inited:int    = 0
+
+fn init(base:int, size:int) -> int:
+  if base == 0 || size < 128: ret (0 - 1)
+  g_heap_base = base
+  g_heap_end  = base + size
+  g_heap_head = base as *HeapBlock
+  (*g_heap_head).magic   = HEAP_MAGIC_FREE
+  (*g_heap_head).size    = size - sizeof(HeapBlock)
+  (*g_heap_head).is_free = 1
+  (*g_heap_head).next    = 0 as *HeapBlock
+  g_inited = 1
+  ret 0
+
+fn alloc(n:int) -> int:
+  if g_inited == 0 || n <= 0: ret 0
+  // Align to HEAP_ALIGN
+  n = ((n + HEAP_ALIGN - 1) / HEAP_ALIGN) * HEAP_ALIGN
+  cur:*HeapBlock = g_heap_head
+  while cur != 0 as *HeapBlock:
+    if (*cur).is_free != 0 && (*cur).size >= n:
+      remain:int = (*cur).size - n
+      if remain > sizeof(HeapBlock) + HEAP_ALIGN:
+        // Split block
+        nxt:*HeapBlock = (cur as int + sizeof(HeapBlock) + n) as *HeapBlock
+        (*nxt).magic   = HEAP_MAGIC_FREE
+        (*nxt).size    = remain - sizeof(HeapBlock)
+        (*nxt).is_free = 1
+        (*nxt).next    = (*cur).next
+        (*cur).next    = nxt
+        (*cur).size    = n
+      (*cur).magic   = HEAP_MAGIC_USED
+      (*cur).is_free = 0
+      ret (cur as int + sizeof(HeapBlock))
+    cur = (*cur).next
+  ret 0   // out of heap
+
+fn kfree(ptr:int) -> int:
+  if ptr == 0: ret 0
+  blk:*HeapBlock = (ptr - sizeof(HeapBlock)) as *HeapBlock
+  if (*blk).magic != HEAP_MAGIC_USED: ret (0 - 1)  // double-free or corrupt
+  (*blk).magic   = HEAP_MAGIC_FREE
+  (*blk).is_free = 1
+  // Coalesce with next
+  nxt:*HeapBlock = (*blk).next
+  if nxt != 0 as *HeapBlock && (*nxt).is_free != 0:
+    (*blk).size = (*blk).size + sizeof(HeapBlock) + (*nxt).size
+    (*blk).next = (*nxt).next
+  // Coalesce with previous (scan from head)
+  prev:*HeapBlock = 0 as *HeapBlock
+  cur:*HeapBlock  = g_heap_head
+  while cur != 0 as *HeapBlock && cur != blk:
+    prev = cur
+    cur  = (*cur).next
+  if prev != 0 as *HeapBlock && (*prev).is_free != 0:
+    (*prev).size = (*prev).size + sizeof(HeapBlock) + (*blk).size
+    (*prev).next = (*blk).next
+  ret 0
+
+fn realloc(ptr:int, new_size:int) -> int:
+  if ptr == 0: ret alloc(new_size)
+  blk:*HeapBlock = (ptr - sizeof(HeapBlock)) as *HeapBlock
+  if (*blk).size >= new_size: ret ptr   // fits in place
+  new_ptr:int = alloc(new_size)
+  if new_ptr == 0: ret 0
+  // Copy old data
+  src:*char = ptr as *char
+  dst:*char = new_ptr as *char
+  i:int = 0
+  while i < (*blk).size:
+    unsafe: dst[i] = src[i]
+    i = i + 1
+  kfree(ptr)
+  ret new_ptr
+
+fn free_bytes() -> int:
+  n:int = 0
+  cur:*HeapBlock = g_heap_head
+  while cur != 0 as *HeapBlock:
+    if (*cur).is_free != 0: n = n + (*cur).size
+    cur = (*cur).next
+  ret n
+
+fn total_bytes() -> int:
+  ret g_heap_end - g_heap_base

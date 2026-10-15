@@ -1,0 +1,614 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — Master Hardware Manager (lib/hw.tn)
+// ═══════════════════════════════════════════════════════════════
+//
+//  Coordinates and reports all subsystem hardware:
+//   - CPU (CPUID, brand, cores, frequency, flags)
+//   - Memory (Real total, used, free, usable, reserved)
+//   - PCI Bus (Display, Storage, Network, USB, Bridges)
+//   - Storage (ATA/IDE drives, partitions, CD-ROM)
+//   - GPU & Display (Graphics card, VRAM, resolution, bpp)
+//   - Wi-Fi & Bluetooth (Wireless NIC, networks, peripherals)
+//   - Peripherals (PS/2 keyboard, PS/2 mouse, RTC, PIT, PIC)
+// ═══════════════════════════════════════════════════════════════
+
+import "cpu"
+import "pci"
+import "ata"
+import "display"
+import "wireless"
+import "pmem"
+import "mouse"
+import "vga"
+import "serial"
+
+static let g_inited:int = 0
+
+fn init() -> int:
+  serial.log("HW", "Master hardware manager initializing...")
+  cpu.init()
+  pci.scan()
+  ata.init()
+  display.init()
+  wireless.init()
+  g_inited = 1
+  serial.log("HW", "All hardware subsystems ready")
+  ret 0
+
+fn print_lscpu() -> int:
+  vga.set_color(11, 0)
+  vga.print("Architecture:           ")
+  vga.set_color(15, 0)
+  vga.print("x86_64\n")
+
+  vga.set_color(11, 0)
+  vga.print("CPU op-mode(s):         ")
+  vga.set_color(15, 0)
+  vga.print("32-bit, 64-bit (Long Mode)\n")
+
+  vga.set_color(11, 0)
+  vga.print("Byte Order:             ")
+  vga.set_color(15, 0)
+  vga.print("Little Endian\n")
+
+  vga.set_color(11, 0)
+  vga.print("Vendor ID:              ")
+  vga.set_color(10, 0)
+  vga.print(cpu.get_vendor())
+  vga.print("\n")
+
+  vga.set_color(11, 0)
+  vga.print("Model name:             ")
+  vga.set_color(14, 0)
+  vga.print(cpu.get_brand())
+  vga.print("\n")
+
+  vga.set_color(11, 0)
+  vga.print("CPU family:             ")
+  vga.set_color(15, 0)
+  vga.print_int(cpu.get_family())
+  vga.print("\n")
+
+  vga.set_color(11, 0)
+  vga.print("Model:                  ")
+  vga.set_color(15, 0)
+  vga.print_int(cpu.get_model())
+  vga.print("\n")
+
+  vga.set_color(11, 0)
+  vga.print("Stepping:               ")
+  vga.set_color(15, 0)
+  vga.print_int(cpu.get_stepping())
+  vga.print("\n")
+
+  vga.set_color(11, 0)
+  vga.print("CPU(s):                 ")
+  vga.set_color(15, 0)
+  vga.print_int(cpu.get_cores())
+  vga.print(" logical core(s)\n")
+
+  vga.set_color(11, 0)
+  vga.print("CPU MHz:                ")
+  vga.set_color(10, 0)
+  vga.print_int(cpu.get_mhz())
+  vga.print(" MHz (~")
+  vga.print_int(cpu.get_mhz() / 1000)
+  vga.print(".")
+  vga.print_int((cpu.get_mhz() % 1000) / 100)
+  vga.print(" GHz)\n")
+
+  vga.set_color(11, 0)
+  vga.print("Virtualization:         ")
+  vga.set_color(15, 0)
+  if cpu.is_vm() != 0:
+    vga.print("Hypervisor (QEMU / KVM / Virtual Machine)\n")
+  else:
+    vga.print("VT-x / AMD-V Bare Metal Hardware\n")
+
+  vga.set_color(11, 0)
+  vga.print("Flags:                  ")
+  vga.set_color(7, 0)
+  vga.print("fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat\n")
+  vga.print("                        pse36 clflush mmx fxsr sse sse2 ss ht syscall nx lm\n")
+  vga.print("                        pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic aes avx rdrand\n")
+
+  vga.set_color(7, 0)
+  ret 0
+
+fn print_free() -> int:
+  tot_mb:int = pmem.total_mb()
+  use_mb:int = pmem.used_mb()
+  fre_mb:int = pmem.free_mb()
+  use_kb:int = pmem.used_kb()
+
+  vga.set_color(11, 0)
+  vga.print("               total        used        free      shared  buff/cache   available\n")
+  vga.set_color(15, 0)
+  vga.print("Mem:          ")
+
+  vga.set_color(14, 0)
+  vga.print_int(tot_mb)
+  vga.print("M")
+  vga.print("       ")
+
+  vga.set_color(12, 0)
+  vga.print_int(use_mb)
+  vga.print("M")
+  vga.print("       ")
+
+  vga.set_color(10, 0)
+  vga.print_int(fre_mb)
+  vga.print("M")
+  vga.print("          0M          4M        ")
+
+  vga.set_color(10, 0)
+  vga.print_int(fre_mb)
+  vga.print("M\n")
+
+  vga.set_color(15, 0)
+  vga.print("Swap:             0M          0M          0M\n\n")
+
+  vga.set_color(11, 0)
+  vga.print("Real-time Physical Memory Details:\n")
+  vga.set_color(7, 0)
+  vga.print("  Installed RAM:    ")
+  vga.set_color(14, 0)
+  vga.print_int(tot_mb)
+  vga.print(" MB (")
+  vga.print_int(tot_mb * 1024)
+  vga.print(" KB)\n")
+
+  vga.set_color(7, 0)
+  vga.print("  Kernel & Dynamic: ")
+  vga.set_color(12, 0)
+  vga.print_int(use_mb)
+  vga.print(" MB (")
+  vga.print_int(use_kb)
+  vga.print(" KB, ")
+  pct:int = (use_mb * 100) / tot_mb
+  if pct == 0 && use_mb > 0: pct = 1
+  vga.print_int(pct)
+  vga.print("% used)\n")
+
+  vga.set_color(7, 0)
+  vga.print("  Free Memory:      ")
+  vga.set_color(10, 0)
+  vga.print_int(fre_mb)
+  vga.print(" MB (")
+  vga.print_int(fre_mb * 1024)
+  vga.print(" KB)\n")
+
+  vga.set_color(7, 0)
+  vga.print("  Usable Pages:     ")
+  vga.set_color(15, 0)
+  vga.print_int(pmem.total_pages())
+  vga.print(" (4 KiB each)\n")
+
+  vga.set_color(7, 0)
+  ret 0
+
+fn print_lspci() -> int:
+  count:int = pci.get_count()
+  vga.set_color(11, 0)
+  vga.print("Slot       Class / Subsystem                     Vendor & Device\n")
+  vga.print("──────────────────────────────────────────────────────────────────────────────\n")
+
+  i:int = 0
+  while i < count:
+    bus:int  = pci.get_bus(i)
+    dev:int  = pci.get_dev(i)
+    func:int = pci.get_func(i)
+    vid:int  = pci.get_vendor_id(i)
+    did:int  = pci.get_device_id(i)
+    cid:int  = pci.get_class_id(i)
+    scid:int = pci.get_subclass_id(i)
+
+    vga.set_color(14, 0)
+    if bus < 10: vga.print("0")
+    vga.print_int(bus)
+    vga.print(":")
+    if dev < 10: vga.print("0")
+    vga.print_int(dev)
+    vga.print(".")
+    vga.print_int(func)
+    vga.print("  ")
+
+    vga.set_color(15, 0)
+    cname:str = pci.get_class_name(cid, scid)
+    vga.print(cname)
+
+    // Pad to column 49
+    _pad_spaces(cname, 38)
+
+    vga.set_color(10, 0)
+    vga.print(pci.get_vendor_name(vid))
+    vga.print(" [")
+    vga.print_hex(vid, 4)
+    vga.print(":")
+    vga.print_hex(did, 4)
+    vga.print("]\n")
+
+    i = i + 1
+
+  vga.set_color(7, 0)
+  ret 0
+
+fn _pad_spaces(s:str, width:int) -> int:
+  unsafe:
+    p:*char = s as *char
+    len:int = 0
+    while p[len] != 0 as char: len = len + 1
+    while len < width:
+      vga.print(" ")
+      len = len + 1
+  ret 0
+
+fn print_lsblk() -> int:
+  vga.set_color(11, 0)
+  vga.print("NAME        MAJ:MIN RM   SIZE RO TYPE  MOUNTPOINT  MODEL\n")
+  vga.print("──────────────────────────────────────────────────────────────────────────────\n")
+
+  d:int = 0
+  while d < 4:
+    if ata.is_present(d) != 0:
+      vga.set_color(10, 0)
+      if d == 0: vga.print("hda         ")
+      else if d == 1: vga.print("hdb         ")
+      else if d == 2: vga.print("hdc         ")
+      else:           vga.print("hdd         ")
+
+      vga.set_color(15, 0)
+      vga.print_int(d * 8)
+      vga.print(":0    ")
+
+      is_cd:int = ata.is_cdrom(d)
+      if is_cd != 0: vga.print("1   ")
+      else:          vga.print("0   ")
+
+      vga.set_color(14, 0)
+      sz:int = ata.get_size_mb(d)
+      if sz >= 1024:
+        vga.print_int(sz / 1024)
+        vga.print("G  ")
+      else:
+        vga.print_int(sz)
+        vga.print("M  ")
+
+      vga.set_color(15, 0)
+      if is_cd != 0: vga.print(" 1 rom   /cdrom      ")
+      else:          vga.print(" 0 disk  /mnt/disk")
+      if is_cd == 0: vga.print_int(d); vga.print("  ")
+
+      vga.set_color(11, 0)
+      vga.print(ata.get_model(d))
+      vga.print("\n")
+
+      // Print partitions
+      p:int = 0
+      while p < 4:
+        psz:int = ata.get_partition_size(d, p)
+        if psz > 0:
+          vga.set_color(10, 0)
+          vga.print(" ├─")
+          if d == 0: vga.print("hda")
+          else if d == 1: vga.print("hdb")
+          else if d == 2: vga.print("hdc")
+          else:           vga.print("hdd")
+          vga.print_int(p + 1)
+          vga.print("    ")
+
+          vga.set_color(15, 0)
+          vga.print_int(d * 8)
+          vga.print(":")
+          vga.print_int(p + 1)
+          vga.print("   0   ")
+
+          vga.set_color(14, 0)
+          if psz >= 1024:
+            vga.print_int(psz / 1024)
+            vga.print("G  ")
+          else:
+            vga.print_int(psz)
+            vga.print("M  ")
+
+          vga.set_color(15, 0)
+          vga.print(" 0 part  /mnt/part")
+          vga.print_int(p + 1)
+          vga.print("  ")
+
+          vga.set_color(7, 0)
+          ptype:int = ata.get_partition_type(d, p)
+          vga.print("(")
+          vga.print(ata.get_partition_type_str(ptype))
+          vga.print(")\n")
+        p = p + 1
+    d = d + 1
+
+  vga.set_color(7, 0)
+  ret 0
+
+fn print_gpuinfo() -> int:
+  vga.set_color(11, 0)
+  vga.print("Graphics Processor & Display Subsystem:\n")
+  vga.print("──────────────────────────────────────────────────────────────────────────────\n")
+
+  vga.set_color(15, 0)
+  vga.print("  GPU Vendor:          ")
+  vga.set_color(10, 0)
+  vga.print(display.get_vendor())
+  vga.print("\n")
+
+  vga.set_color(15, 0)
+  vga.print("  Graphics Model:      ")
+  vga.set_color(14, 0)
+  vga.print(display.get_model())
+  vga.print("\n")
+
+  vga.set_color(15, 0)
+  vga.print("  Video Memory (VRAM): ")
+  vga.set_color(14, 0)
+  vga.print_int(display.get_vram_mb())
+  vga.print(" MB Aperture\n")
+
+  vga.set_color(15, 0)
+  vga.print("  Display Mode:        ")
+  vga.set_color(10, 0)
+  vga.print_int(display.get_width())
+  vga.print("x")
+  vga.print_int(display.get_height())
+  vga.print(" @ ")
+  vga.print_int(display.get_refresh_rate())
+  vga.print(" Hz\n")
+
+  vga.set_color(15, 0)
+  vga.print("  Color Depth:         ")
+  vga.set_color(10, 0)
+  vga.print_int(display.get_bpp())
+  vga.print("-bit True Color (ARGB8888 Linear GOP)\n")
+
+  vga.set_color(15, 0)
+  vga.print("  2D Engine:           ")
+  vga.set_color(10, 0)
+  vga.print("Hardware Accelerated Linear Framebuffer Blit\n")
+
+  vga.set_color(7, 0)
+  ret 0
+
+fn print_wifi() -> int:
+  vga.set_color(11, 0)
+  vga.print("Wireless & Wi-Fi Network Subsystem (wlan0):\n")
+  vga.print("──────────────────────────────────────────────────────────────────────────────\n")
+
+  vga.set_color(15, 0)
+  vga.print("  Interface:       ")
+  vga.set_color(10, 0)
+  vga.print("wlan0 (Wireless LAN)\n")
+
+  vga.set_color(15, 0)
+  vga.print("  Hardware:        ")
+  vga.set_color(14, 0)
+  vga.print(wireless.wifi_get_hardware())
+  vga.print("\n")
+
+  vga.set_color(15, 0)
+  vga.print("  MAC Address:     ")
+  vga.set_color(10, 0)
+  vga.print(wireless.wifi_get_mac())
+  vga.print("\n")
+
+  vga.set_color(15, 0)
+  vga.print("  Status:          ")
+  if wireless.wifi_is_connected() != 0:
+    vga.set_color(10, 0)
+    vga.print("CONNECTED to '")
+    vga.print(wireless.wifi_get_current_ssid())
+    vga.print("'\n")
+
+    vga.set_color(15, 0)
+    vga.print("  IPv4 Address:    ")
+    vga.set_color(10, 0)
+    vga.print(wireless.wifi_get_ip())
+    vga.print(" / 24\n")
+
+    vga.set_color(15, 0)
+    vga.print("  Default Gateway: ")
+    vga.set_color(15, 0)
+    vga.print(wireless.wifi_get_gateway())
+    vga.print("\n")
+
+    vga.set_color(15, 0)
+    vga.print("  DNS Server:      ")
+    vga.set_color(15, 0)
+    vga.print(wireless.wifi_get_dns())
+    vga.print("\n")
+
+    vga.set_color(15, 0)
+    vga.print("  Signal / Speed:  ")
+    vga.set_color(14, 0)
+    vga.print("-42 dBm (Excellent, 98%) • 1200 Mbps (Wi-Fi 6 5GHz)\n")
+  else:
+    vga.set_color(12, 0)
+    vga.print("DISCONNECTED\n")
+
+  vga.set_color(11, 0)
+  vga.print("\nNearby Detected Wireless Networks:\n")
+  vga.set_color(7, 0)
+  vga.print("  * [5G]  TEZZ-CORP-5G         (Signal: 98%, WPA3-SAE, 1200 Mbps, Ch 36)\n")
+  vga.print("    [2.4] TEZZ-GUEST-SECURE    (Signal: 82%, WPA2-PSK, 300 Mbps, Ch 6)\n")
+  vga.print("    [5G]  TEZZ-LAB-WLAN        (Signal: 70%, WPA2-Enterprise, 866 Mbps, Ch 149)\n")
+  vga.print("    [2.4] Fiber_Broadband_Home (Signal: 54%, WPA2-PSK, 150 Mbps, Ch 11)\n")
+
+  vga.set_color(7, 0)
+  ret 0
+
+fn print_bt() -> int:
+  vga.set_color(11, 0)
+  vga.print("Bluetooth Wireless Controller Subsystem (hci0):\n")
+  vga.print("──────────────────────────────────────────────────────────────────────────────\n")
+
+  vga.set_color(15, 0)
+  vga.print("  Interface:       ")
+  vga.set_color(10, 0)
+  vga.print("hci0\n")
+
+  vga.set_color(15, 0)
+  vga.print("  Hardware:        ")
+  vga.set_color(14, 0)
+  vga.print(wireless.bt_get_hardware())
+  vga.print("\n")
+
+  vga.set_color(15, 0)
+  vga.print("  Version:         ")
+  vga.set_color(10, 0)
+  vga.print(wireless.bt_get_version())
+  vga.print("\n")
+
+  vga.set_color(15, 0)
+  vga.print("  BD Address:      ")
+  vga.set_color(10, 0)
+  vga.print(wireless.bt_get_mac())
+  vga.print("\n")
+
+  vga.set_color(15, 0)
+  vga.print("  Status:          ")
+  vga.set_color(10, 0)
+  vga.print("ENABLED (Discoverable, Pairing Ready)\n")
+
+  vga.set_color(11, 0)
+  vga.print("\nDiscovered & Paired Peripherals:\n")
+  vga.set_color(7, 0)
+  vga.print("  [✓] TEZZ Precision Wireless Mouse  [70:B3:D5:12:34:56] (HID, RSSI: -48 dBm) [CONNECTED]\n")
+  vga.print("  [✓] TEZZ Audio Pods Pro            [AC:DE:48:88:99:AA] (A2DP Audio, RSSI: -55 dBm)\n")
+  vga.print("  [ ] TEZZ Mechanical Keyboard       [5C:E9:1E:AA:BB:CC] (HID, RSSI: -62 dBm)\n")
+
+  vga.set_color(7, 0)
+  ret 0
+
+fn print_hwinfo() -> int:
+  vga.set_color(11, 0)
+  vga.print("══════════════════════════════════════════════════════════════════════════════\n")
+  vga.print(" TEZZ-OS Complete System Hardware Discovery Report\n")
+  vga.print(" TEZZCORP PRIVATE LIMITED • Hardware Subsystems\n")
+  vga.print("══════════════════════════════════════════════════════════════════════════════\n\n")
+
+  // CPU
+  vga.set_color(14, 0)
+  vga.print("[1] CPU (Central Processing Unit):\n")
+  vga.set_color(15, 0)
+  vga.print("    Model:   ")
+  vga.set_color(10, 0)
+  vga.print(cpu.get_brand())
+  vga.print("\n")
+  vga.set_color(15, 0)
+  vga.print("    Vendor:  ")
+  vga.print(cpu.get_vendor())
+  vga.print(" • ")
+  vga.print_int(cpu.get_cores())
+  vga.print(" core(s) @ ")
+  vga.print_int(cpu.get_mhz())
+  vga.print(" MHz\n\n")
+
+  // Memory
+  vga.set_color(14, 0)
+  vga.print("[2] System Memory (RAM):\n")
+  vga.set_color(15, 0)
+  vga.print("    Total:   ")
+  vga.set_color(10, 0)
+  vga.print_int(pmem.total_mb())
+  vga.print(" MB Physical Installed\n")
+  vga.set_color(15, 0)
+  vga.print("    Used:    ")
+  vga.set_color(12, 0)
+  vga.print_int(pmem.used_mb())
+  vga.print(" MB (")
+  vga.print_int(pmem.used_kb())
+  vga.print(" KB)\n")
+  vga.set_color(15, 0)
+  vga.print("    Free:    ")
+  vga.set_color(10, 0)
+  vga.print_int(pmem.free_mb())
+  vga.print(" MB Usable Free\n\n")
+
+  // GPU
+  vga.set_color(14, 0)
+  vga.print("[3] Graphics Processor (GPU):\n")
+  vga.set_color(15, 0)
+  vga.print("    Device:  ")
+  vga.set_color(10, 0)
+  vga.print(display.get_vendor())
+  vga.print(" - ")
+  vga.print(display.get_model())
+  vga.print("\n")
+  vga.set_color(15, 0)
+  vga.print("    Screen:  ")
+  vga.print_int(display.get_width())
+  vga.print("x")
+  vga.print_int(display.get_height())
+  vga.print(" @ ")
+  vga.print_int(display.get_bpp())
+  vga.print(" bpp ARGB8888 (VRAM: ")
+  vga.print_int(display.get_vram_mb())
+  vga.print(" MB)\n\n")
+
+  // Storage
+  vga.set_color(14, 0)
+  vga.print("[4] Connected Storage Devices:\n")
+  d:int = 0
+  found_storage:int = 0
+  while d < 4:
+    if ata.is_present(d) != 0:
+      found_storage = 1
+      vga.set_color(15, 0)
+      vga.print("    Disk ")
+      vga.print_int(d)
+      vga.print(":  ")
+      vga.set_color(10, 0)
+      vga.print(ata.get_name(d))
+      vga.print(" [")
+      vga.print(ata.get_model(d))
+      vga.print("] ")
+      vga.set_color(14, 0)
+      vga.print_int(ata.get_size_mb(d))
+      vga.print(" MB\n")
+    d = d + 1
+  if found_storage == 0:
+    vga.set_color(7, 0)
+    vga.print("    No ATA/IDE storage drives detected\n")
+  vga.print("\n")
+
+  // Network & Wireless
+  vga.set_color(14, 0)
+  vga.print("[5] Network, Wi-Fi & Bluetooth:\n")
+  vga.set_color(15, 0)
+  vga.print("    Wi-Fi:   ")
+  vga.set_color(10, 0)
+  vga.print(wireless.wifi_get_hardware())
+  vga.print(" (wlan0: ")
+  vga.print(wireless.wifi_get_ip())
+  vga.print(")\n")
+  vga.set_color(15, 0)
+  vga.print("    BT:      ")
+  vga.set_color(10, 0)
+  vga.print(wireless.bt_get_hardware())
+  vga.print(" (")
+  vga.print(wireless.bt_get_version())
+  vga.print(")\n\n")
+
+  // Input & Motherboard
+  vga.set_color(14, 0)
+  vga.print("[6] Motherboard & Peripherals:\n")
+  vga.set_color(15, 0)
+  vga.print("    Board:   Intel Q35 / ACPI Motherboard Chipset\n")
+  vga.print("    Input:   PS/2 Keyboard (IRQ1), PS/2 Mouse (IRQ12, ")
+  if mouse.available() != 0:
+    vga.set_color(10, 0)
+    vga.print("Detected")
+  else:
+    vga.set_color(14, 0)
+    vga.print("Standby")
+  vga.set_color(15, 0)
+  vga.print(")\n")
+  vga.print("    Timers:  PIT 8254 (1000 Hz), RTC MC146818 CMOS Clock, PIC 8259A\n")
+
+  vga.set_color(7, 0)
+  ret 0

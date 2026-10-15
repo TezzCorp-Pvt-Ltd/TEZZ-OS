@@ -1,0 +1,81 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — Programmable Interval Timer 8253/8254 & TSC (lib/pit.tn)
+// ═══════════════════════════════════════════════════════════════
+
+import "sys"
+
+extern fn sys_rdtsc() -> int
+
+let PIT_CMD:int       = 0x43
+let PIT_DATA0:int     = 0x40
+let PIT_DATA2:int     = 0x42
+let PIT_BASE_FREQ:int = 1193182
+
+static let g_ticks:int      = 0
+static let g_hz:int         = 1000
+static let g_start_tsc:int  = 0
+static let g_tsc_per_ms:int = 2000000
+static let g_calibrated:int = 0
+
+fn init(freq_hz:int) -> int:
+  g_hz = freq_hz
+  divisor:int = PIT_BASE_FREQ / freq_hz
+  // Channel 0, Access mode: lobyte/hibyte, Mode 3 (Square wave generator), Binary
+  sys.sys_outb(PIT_CMD, 0x36)
+  sys.sys_outb(PIT_DATA0, divisor & 0xFF)
+  sys.sys_outb(PIT_DATA0, (divisor >> 8) & 0xFF)
+
+  // Calibrate TSC using PIT Channel 2 (approx 10 ms = 11932 counts)
+  orig_61:int = sys.sys_inb(0x61)
+  sys.sys_outb(0x61, orig_61 & 0xFC)
+  sys.sys_outb(PIT_CMD, 0xB0)
+  sys.sys_outb(PIT_DATA2, 11932 & 0xFF)
+  sys.sys_outb(PIT_DATA2, (11932 >> 8) & 0xFF)
+
+  t0:int = sys_rdtsc()
+  sys.sys_outb(0x61, (orig_61 & 0xFC) | 1)
+
+  timeout:int = 1000000
+  while (sys.sys_inb(0x61) & 0x20) == 0 && timeout > 0:
+    timeout = timeout - 1
+  t1:int = sys_rdtsc()
+  sys.sys_outb(0x61, orig_61)
+
+  delta:int = t1 - t0
+  if delta > 100000 && timeout > 0:
+    g_tsc_per_ms = delta / 10
+  else:
+    g_tsc_per_ms = 2000000
+
+  g_start_tsc = sys_rdtsc()
+  g_calibrated = 1
+  ret 0
+
+fn tick() -> int:
+  g_ticks = g_ticks + 1
+  ret 0
+
+fn ticks() -> int:
+  ret uptime_ms()
+
+fn uptime_ms() -> int:
+  if g_calibrated == 0:
+    g_start_tsc = sys_rdtsc()
+    g_calibrated = 1
+  now:int = sys_rdtsc()
+  if now < g_start_tsc: ret 0
+  diff:int = now - g_start_tsc
+  if g_tsc_per_ms <= 0: ret 0
+  ret diff / g_tsc_per_ms
+
+fn ms() -> int:
+  ret uptime_ms()
+
+fn sleep_ms(target_ms:int) -> int:
+  if target_ms <= 0: ret 0
+  if g_tsc_per_ms <= 0: ret 0
+  target_cycles:int = target_ms * g_tsc_per_ms
+  start:int = sys_rdtsc()
+  while (sys_rdtsc() - start) < target_cycles:
+    1
+  ret 0

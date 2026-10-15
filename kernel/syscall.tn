@@ -1,0 +1,7 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — System Call Table (kernel/syscall.tn — Phase 1)
+// ═══════════════════════════════════════════════════════════════
+
+fn init() -> int:
+  // Register POSIX-subset handlers — Phase 1 stub
+  ret 0

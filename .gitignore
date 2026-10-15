@@ -1,0 +1,15 @@
+# Build output & artifacts
+build/
+*.o
+*.elf
+*.iso
+*.ppm
+*.bmp
+*.img
+*.log
+
+# Editor & OS metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

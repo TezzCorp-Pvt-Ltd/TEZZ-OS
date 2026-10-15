@@ -1,0 +1,5 @@
+
+static let g_buf:[char;40960]
+fn main() -> int:
+  unsafe: g_buf[0] = 65 as char
+  ret 0

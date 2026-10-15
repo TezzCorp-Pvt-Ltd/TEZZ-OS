@@ -1,0 +1,186 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — PCI Bus Scanner & Hardware Discovery (lib/pci.tn)
+// ═══════════════════════════════════════════════════════════════
+//
+//  Direct-to-metal PCI configuration mechanism #1:
+//    0xCF8: PCI_CONFIG_ADDRESS
+//    0xCFC: PCI_CONFIG_DATA
+//  Discovers:
+//    - Display Controllers / GPUs (Intel, NVIDIA, AMD, QEMU)
+//    - Storage Controllers (IDE, SATA AHCI, NVMe)
+//    - Network Adapters & Wi-Fi controllers
+//    - Audio, USB 3.0 xHCI, Bridges, Chipset
+// ═══════════════════════════════════════════════════════════════
+
+import "serial"
+
+extern fn sys_outl(port:int, val:int) -> int
+extern fn sys_inl(port:int) -> int
+
+let PCI_CONFIG_ADDR:int = 0xCF8
+let PCI_CONFIG_DATA:int = 0xCFC
+
+struct PciDevice:
+  bus:int
+  dev:int
+  func:int
+  vendor_id:int
+  device_id:int
+  class_id:int
+  subclass_id:int
+  prog_if:int
+  bar0:int
+  bar1:int
+  irq:int
+
+static let g_pci_bus:[int;32]
+static let g_pci_dev:[int;32]
+static let g_pci_func:[int;32]
+static let g_pci_vid:[int;32]
+static let g_pci_did:[int;32]
+static let g_pci_cid:[int;32]
+static let g_pci_scid:[int;32]
+static let g_pci_bar0:[int;32]
+static let g_dev_count:int = 0
+static let g_inited:int    = 0
+
+fn read_32(bus:int, dev:int, func:int, offset:int) -> int:
+  addr:int = (1 << 31) | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC)
+  sys_outl(PCI_CONFIG_ADDR, addr)
+  ret sys_inl(PCI_CONFIG_DATA)
+
+fn read_16(bus:int, dev:int, func:int, offset:int) -> int:
+  addr:int = (1 << 31) | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC)
+  sys_outl(PCI_CONFIG_ADDR, addr)
+  val:int = sys_inl(PCI_CONFIG_DATA)
+  shift:int = (offset & 2) * 8
+  ret (val >> shift) & 0xFFFF
+
+fn read_8(bus:int, dev:int, func:int, offset:int) -> int:
+  addr:int = (1 << 31) | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC)
+  sys_outl(PCI_CONFIG_ADDR, addr)
+  val:int = sys_inl(PCI_CONFIG_DATA)
+  shift:int = (offset & 3) * 8
+  ret (val >> shift) & 0xFF
+
+fn write_32(bus:int, dev:int, func:int, offset:int, val:int) -> int:
+  addr:int = (1 << 31) | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC)
+  sys_outl(PCI_CONFIG_ADDR, addr)
+  sys_outl(PCI_CONFIG_DATA, val)
+  ret 0
+
+fn scan() -> int:
+  g_dev_count = 0
+  bus:int = 0
+  while bus < 8:
+    dev:int = 0
+    while dev < 32:
+      // Check function 0 first
+      vendor:int = read_16(bus, dev, 0, 0)
+      if vendor != 0xFFFF && vendor != 0:
+        hdr:int = read_8(bus, dev, 0, 14)
+        max_func:int = 1
+        if (hdr & 0x80) != 0: max_func = 8 // Multi-function
+
+        func:int = 0
+        while func < max_func:
+          v:int = read_16(bus, dev, func, 0)
+          if v != 0xFFFF && v != 0:
+            if g_dev_count < 32:
+              unsafe:
+                g_pci_bus[g_dev_count]  = bus
+                g_pci_dev[g_dev_count]  = dev
+                g_pci_func[g_dev_count] = func
+                g_pci_vid[g_dev_count]  = v
+                g_pci_did[g_dev_count]  = read_16(bus, dev, func, 2)
+                g_pci_cid[g_dev_count]  = read_8(bus, dev, func, 11)
+                g_pci_scid[g_dev_count] = read_8(bus, dev, func, 10)
+                g_pci_bar0[g_dev_count] = read_32(bus, dev, func, 0x10)
+              g_dev_count = g_dev_count + 1
+          func = func + 1
+      dev = dev + 1
+    bus = bus + 1
+
+  g_inited = 1
+  serial.log("PCI", "Bus scan complete")
+  ret g_dev_count
+
+fn get_count() -> int:
+  if g_inited == 0: scan()
+  ret g_dev_count
+
+fn get_bus(idx:int) -> int:
+  if idx < 0 || idx >= g_dev_count: ret 0
+  unsafe: ret g_pci_bus[idx]
+
+fn get_dev(idx:int) -> int:
+  if idx < 0 || idx >= g_dev_count: ret 0
+  unsafe: ret g_pci_dev[idx]
+
+fn get_func(idx:int) -> int:
+  if idx < 0 || idx >= g_dev_count: ret 0
+  unsafe: ret g_pci_func[idx]
+
+fn get_vendor_id(idx:int) -> int:
+  if idx < 0 || idx >= g_dev_count: ret 0
+  unsafe: ret g_pci_vid[idx]
+
+fn get_device_id(idx:int) -> int:
+  if idx < 0 || idx >= g_dev_count: ret 0
+  unsafe: ret g_pci_did[idx]
+
+fn get_class_id(idx:int) -> int:
+  if idx < 0 || idx >= g_dev_count: ret 0
+  unsafe: ret g_pci_cid[idx]
+
+fn get_subclass_id(idx:int) -> int:
+  if idx < 0 || idx >= g_dev_count: ret 0
+  unsafe: ret g_pci_scid[idx]
+
+fn get_bar0(idx:int) -> int:
+  if idx < 0 || idx >= g_dev_count: ret 0
+  unsafe: ret g_pci_bar0[idx]
+
+fn get_class_name(cid:int, scid:int) -> str:
+  if cid == 0x01:
+    if scid == 0x01: ret "IDE Storage Controller"
+    if scid == 0x06: ret "SATA AHCI Controller"
+    if scid == 0x08: ret "NVM Express (NVMe) SSD"
+    ret "Mass Storage Controller"
+  if cid == 0x02:
+    if scid == 0x00: ret "Ethernet Controller"
+    if scid == 0x80: ret "Wireless Network (Wi-Fi)"
+    ret "Network Controller"
+  if cid == 0x03:
+    if scid == 0x00: ret "VGA Compatible Controller (GPU)"
+    if scid == 0x02: ret "3D Graphics Accelerator"
+    ret "Display Controller (GPU)"
+  if cid == 0x04:
+    if scid == 0x03: ret "High Definition Audio Device"
+    ret "Multimedia Audio Controller"
+  if cid == 0x06:
+    if scid == 0x00: ret "Host Bridge / Memory Controller"
+    if scid == 0x01: ret "ISA / LPC Bridge"
+    if scid == 0x04: ret "PCI-to-PCI Bridge"
+    ret "Bridge Device"
+  if cid == 0x0C:
+    if scid == 0x03: ret "USB Controller (xHCI/EHCI)"
+    if scid == 0x05: ret "SMBus Controller"
+    ret "Serial Bus Controller"
+  if cid == 0x0D:
+    if scid == 0x11: ret "Bluetooth Wireless Controller"
+    ret "Wireless RF Controller"
+  ret "PCI Device"
+
+fn get_vendor_name(vid:int) -> str:
+  if vid == 0x8086: ret "Intel Corporation"
+  if vid == 0x10DE: ret "NVIDIA Corporation"
+  if vid == 0x1002: ret "Advanced Micro Devices [AMD/ATI]"
+  if vid == 0x10EC: ret "Realtek Semiconductor"
+  if vid == 0x1234 || vid == 0x1B36: ret "QEMU / Red Hat"
+  if vid == 0x15AD: ret "VMware Inc."
+  if vid == 0x80EE: ret "VirtualBox System"
+  if vid == 0x14E4: ret "Broadcom Inc."
+  if vid == 0x168C: ret "Qualcomm Atheros"
+  if vid == 0x1022: ret "AMD Motherboard Chipset"
+  ret "Generic Hardware Vendor"

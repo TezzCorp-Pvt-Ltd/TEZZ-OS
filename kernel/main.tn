@@ -1,0 +1,378 @@
+// ═══════════════════════════════════════════════════════════════════
+// TEZZ-OS — Kernel Entry Point (kernel/main.tn)
+// ═══════════════════════════════════════════════════════════════════
+//
+//  Boot sequence:
+//    Limine bootloader → _tezzos_entry() → hardware_init() → kmain()
+//
+//  _tezzos_entry() is the raw ELF entry point loaded by Limine.
+//  It sets up a temporary stack, clears BSS, then calls kmain().
+//
+//  Architecture: x86_64 bare-metal
+//  Compile: tezzc buildexe --target=x86_64-bare kernel/main.tn tezzos.elf
+// ═══════════════════════════════════════════════════════════════════
+
+import "serial"
+import "vga"
+import "keyboard"
+import "mouse"
+import "gdt"
+import "idt"
+import "pic"
+import "pit"
+import "pmem"
+import "vmem"
+import "heap"
+import "proc"
+import "syscall"
+import "panic"
+import "shell"
+import "vfs"
+import "hw"
+import "cpu"
+import "ata"
+
+let COLOR_BLACK:int         = 0
+let COLOR_BLUE:int          = 1
+let COLOR_GREEN:int         = 2
+let COLOR_CYAN:int          = 3
+let COLOR_RED:int           = 4
+let COLOR_MAGENTA:int       = 5
+let COLOR_BROWN:int         = 6
+let COLOR_LIGHT_GREY:int    = 7
+let COLOR_DARK_GREY:int     = 8
+let COLOR_LIGHT_BLUE:int    = 9
+let COLOR_LIGHT_GREEN:int   = 10
+let COLOR_LIGHT_CYAN:int    = 11
+let COLOR_LIGHT_RED:int     = 12
+let COLOR_LIGHT_MAGENTA:int = 13
+let COLOR_YELLOW:int        = 14
+let COLOR_WHITE:int         = 15
+
+
+// ─────────────────────────────────────────────────────────────────
+// TEZZ-OS Version
+// ─────────────────────────────────────────────────────────────────
+
+let TEZZOS_VERSION_MAJOR:int = 0
+let TEZZOS_VERSION_MINOR:int = 1
+let TEZZOS_VERSION_PATCH:int = 0
+let TEZZOS_VERSION_STR:str   = "0.1.0"
+let TEZZOS_CODENAME:str      = "Nova"
+let TEZZOS_BUILD_ARCH:str    = "x86_64"
+
+// ─────────────────────────────────────────────────────────────────
+// Boot information (from Limine)
+// ─────────────────────────────────────────────────────────────────
+
+struct BootInfo:
+  memmap_count:int          // number of memory map entries
+  memmap_base:int           // pointer to first MemMapEntry
+  hhdm_offset:int           // higher-half direct map offset
+  kernel_phys_base:int      // physical base of kernel
+  kernel_virt_base:int      // virtual base of kernel
+  rsdp_addr:int             // ACPI RSDP pointer (0 if not found)
+  fb_addr:int               // virtual address of framebuffer
+  fb_width:int              // width in pixels
+  fb_height:int             // height in pixels
+  fb_pitch:int              // bytes per scanline
+  fb_bpp:int                // bits per pixel
+  cmdline:str               // kernel command-line string
+
+// Populated by the boot stub before kmain() is called
+let g_bootinfo:BootInfo
+
+// ─────────────────────────────────────────────────────────────────
+// Kernel temporary stack (16KB, 16-byte aligned)
+// ─────────────────────────────────────────────────────────────────
+
+let KSTACK_SIZE:int = 131072
+let _kstack_guard:int = 0xDEADBEEF  // stack guard canary
+let _kstack:[int;16384]              // 16384 * 8 = 131072 bytes (128 KB)
+let _kstack_top:int = 0                    // set by entry stub
+
+// ─────────────────────────────────────────────────────────────────
+// BSS clear (required before any global state is used)
+// ─────────────────────────────────────────────────────────────────
+
+extern fn _bss_start() -> void
+extern fn _bss_end() -> void
+extern fn _tezzos_entry() -> void  // raw ELF entry — see boot stub
+
+fn bss_clear() -> int:
+  ret 0
+
+// ─────────────────────────────────────────────────────────────────
+// Hardware initialisation — called before anything else
+// ─────────────────────────────────────────────────────────────────
+
+fn hardware_init() -> int:
+  serial.log("HW", "1. GDT")
+  gdt.init()
+  serial.log("HW", "2. IDT")
+  idt.init()
+  serial.log("HW", "3. PIC")
+  pic.init()
+  pic.remap(0x20, 0x28)
+  serial.log("HW", "4. PIT")
+  pit.init(1000)
+  serial.log("HW", "5. PMEM")
+  pmem.init(g_bootinfo.memmap_base, g_bootinfo.memmap_count)
+  serial.log("HW", "6. VMEM")
+  vmem.init(g_bootinfo.hhdm_offset)
+  serial.log("HW", "7. HEAP")
+  heap_phys:int = pmem.alloc_n(1024)
+  heap_virt:int = vmem.phys_to_virt(heap_phys)
+  heap.init(heap_virt, 1024 * 4096)
+  serial.log("HW", "8. SYSCALL & PROC")
+  syscall.init()
+  proc.init()
+  serial.log("HW", "9. KEYBOARD")
+  keyboard.init()
+  serial.log("HW", "10. MOUSE")
+  mouse.init()
+  serial.log("HW", "11. VFS")
+  vfs.init()
+  serial.log("HW", "12. MASTER HARDWARE (CPU, PCI, ATA, GPU, WIRELESS)")
+  hw.init()
+  serial.log("HW", "ALL READY")
+  ret 0
+
+// ─────────────────────────────────────────────────────────────────
+// kmain — Primary kernel entry (called after hardware_init)
+// ─────────────────────────────────────────────────────────────────
+
+fn kmain() -> int:
+  // Clear BSS before any globals are accessed
+  bss_clear()
+
+  // Bring up serial debug first (always available)
+  serial.init(115200)
+  serial.log("TezzOS", "Boot sequence started")
+  serial.print("  HHDM offset: ")
+  serial.print_hex(g_bootinfo.hhdm_offset)
+  serial.print("\r\n")
+
+  serial.print("  Memmap count: ")
+  serial.print_hex(g_bootinfo.memmap_count)
+  serial.print("\r\n")
+  serial.print("  Memmap base: ")
+  serial.print_hex(g_bootinfo.memmap_base)
+  serial.print("\r\n")
+
+  // Walk and print first 5 memmap entries
+  if g_bootinfo.memmap_base != 0 && g_bootinfo.memmap_count > 0:
+    unsafe:
+      entries_ptrs:*int = g_bootinfo.memmap_base as *int
+      idx:int = 0
+      while idx < g_bootinfo.memmap_count && idx < 6:
+        entry_addr:int = entries_ptrs[idx]
+        serial.print("  Entry[")
+        serial.print_hex(idx)
+        serial.print("] ptr=")
+        serial.print_hex(entry_addr)
+        if entry_addr != 0:
+          entry:*MemMapEntry = entry_addr as *MemMapEntry
+          serial.print(" base=")
+          serial.print_hex((*entry).base)
+          serial.print(" len=")
+          serial.print_hex((*entry).length)
+          serial.print(" type=")
+          serial.print_hex((*entry).kind)
+        serial.print("\r\n")
+        idx = idx + 1
+
+  serial.print("  Framebuffer addr: ")
+  serial.print_hex(g_bootinfo.fb_addr)
+  serial.print("\r\n")
+  serial.print("  FB width: ")
+  serial.print_hex(g_bootinfo.fb_width)
+  serial.print("  height: ")
+  serial.print_hex(g_bootinfo.fb_height)
+  serial.print("  pitch: ")
+  serial.print_hex(g_bootinfo.fb_pitch)
+  serial.print("  bpp: ")
+  serial.print_hex(g_bootinfo.fb_bpp)
+  serial.print("\r\n")
+
+  // Initialize display (linear framebuffer if available)
+  if g_bootinfo.fb_addr != 0:
+    vga.init_fb(g_bootinfo.fb_addr, g_bootinfo.fb_width, g_bootinfo.fb_height, g_bootinfo.fb_pitch, g_bootinfo.fb_bpp)
+  else:
+    vga.init()
+  vga.clear()
+
+  // Display TEZZ-OS Boot Banner
+  boot_banner()
+
+  // Initialise hardware
+  serial.log("TezzOS", "Initialising hardware...")
+  hardware_init()
+  serial.log("TezzOS", "Hardware ready")
+
+  tot_mb:int = pmem.total_mb()
+  use_mb:int = pmem.used_mb()
+  fre_mb:int = pmem.free_mb()
+  pct:int    = (use_mb * 100) / tot_mb
+  if pct == 0 && use_mb > 0: pct = 1
+
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print("  CPU:     ")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print(cpu.get_brand())
+  vga.print(" (")
+  vga.print_int(cpu.get_cores())
+  vga.print(" cores @ ")
+  vga.print_int(cpu.get_mhz())
+  vga.print(" MHz)\n")
+
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print("  Memory:  ")
+  vga.set_color(COLOR_YELLOW, COLOR_BLACK)
+  vga.print_int(use_mb)
+  vga.print(" MB")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print(" used / ")
+  vga.set_color(COLOR_LIGHT_GREEN, COLOR_BLACK)
+  vga.print_int(fre_mb)
+  vga.print(" MB")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print(" free / ")
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print_int(tot_mb)
+  vga.print(" MB")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print(" total (")
+  vga.print_int(pct)
+  vga.print("% used)\n")
+
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print("  Storage: ")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("ATA/IDE ")
+  vga.print_int(ata.get_drive_count())
+  vga.print(" drive(s) online\n")
+
+  // Mouse status line
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print("  Mouse:   PS/2 ")
+  if mouse.available() != 0:
+    vga.set_color(COLOR_LIGHT_GREEN, COLOR_BLACK)
+    vga.print("detected\n")
+  else:
+    vga.set_color(COLOR_YELLOW, COLOR_BLACK)
+    vga.print("not detected (keyboard-only mode)\n")
+  vga.set_color(COLOR_LIGHT_GREY, COLOR_BLACK)
+
+  vga.print("\n")
+  serial.log("TezzOS", "Launching shell")
+
+  // Hand off to the interactive shell
+  shell.run()
+
+  // Should never reach here
+  kernel_panic("kmain: shell exited unexpectedly")
+  ret 0
+
+fn main() -> int:
+  ret kmain()
+
+// ─────────────────────────────────────────────────────────────────
+// Boot banner
+// ─────────────────────────────────────────────────────────────────
+
+fn boot_banner() -> int:
+  // Top border
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print("╔══════════════════════════════════════════════════════════════════════════════╗\n")
+
+  // Title line - TEZZ OS in genuine block letters
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("║")
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print("  ████████╗███████╗███████╗███████╗     ██████╗ ███████╗")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("                     ║\n")
+
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("║")
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print("  ╚══██╔══╝██╔════╝╚══███╔╝╚══███╔╝    ██╔═══██╗██╔════╝")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("                     ║\n")
+
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("║")
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print("     ██║   █████╗    ███╔╝   ███╔╝     ██║   ██║███████╗")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("                     ║\n")
+
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("║")
+  vga.set_color(COLOR_CYAN, COLOR_BLACK)
+  vga.print("     ██║   ██╔══╝   ███╔╝   ███╔╝      ██║   ██║╚════██║")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("                     ║\n")
+
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("║")
+  vga.set_color(COLOR_CYAN, COLOR_BLACK)
+  vga.print("     ██║   ███████╗███████╗███████╗    ╚██████╔╝███████║")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("                     ║\n")
+
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("║")
+  vga.set_color(COLOR_CYAN, COLOR_BLACK)
+  vga.print("     ╚═╝   ╚══════╝╚══════╝╚══════╝     ╚═════╝ ╚══════╝")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("                     ║\n")
+
+  // Separator
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print("╠══════════════════════════════════════════════════════════════════════════════╣\n")
+
+  // Info line
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("║  Version: ")
+  vga.set_color(COLOR_LIGHT_GREEN, COLOR_BLACK)
+  vga.print("0.1.0")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print(" \"")
+  vga.set_color(COLOR_YELLOW, COLOR_BLACK)
+  vga.print("Nova")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("\"   Arch: ")
+  vga.set_color(COLOR_LIGHT_GREEN, COLOR_BLACK)
+  vga.print("x86_64")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("   Built with: ")
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print("TezzNative")
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("                     ║\n")
+
+  // Corporate line
+  vga.set_color(COLOR_WHITE, COLOR_BLACK)
+  vga.print("║  TEZZCORP PRIVATE LIMITED (https://tezzcorp.com/) • info@tezzcorp.com        ║\n")
+
+  // Bottom border
+  vga.set_color(COLOR_LIGHT_CYAN, COLOR_BLACK)
+  vga.print("╚══════════════════════════════════════════════════════════════════════════════╝\n\n")
+
+  vga.set_color(COLOR_LIGHT_GREY, COLOR_BLACK)
+  ret 0
+
+// ─────────────────────────────────────────────────────────────────
+// kernel_panic — last resort crash handler
+// ─────────────────────────────────────────────────────────────────
+
+fn kernel_panic(msg:str) -> int:
+  vga.set_color(COLOR_WHITE, COLOR_RED)
+  vga.print("\n\n *** TEZZ-OS KERNEL PANIC *** \n ")
+  vga.print(msg)
+  vga.print("\n System halted. Please reboot.\n")
+  serial.log("PANIC", msg)
+  while 1: 1
+  ret 0

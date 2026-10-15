@@ -1,0 +1,20 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — Global Descriptor Table (kernel/gdt.tn)
+// ═══════════════════════════════════════════════════════════════
+// Under Limine x86_64 boot, 64-bit GDT is initialized by bootloader.
+// This module provides kernel segment verification & state tracking.
+// ═══════════════════════════════════════════════════════════════
+
+static let g_inited:int = 0
+
+let GDT_KERNEL_CODE:int = 0x08
+let GDT_KERNEL_DATA:int = 0x10
+let GDT_USER_CODE:int   = 0x18
+let GDT_USER_DATA:int   = 0x20
+
+fn init() -> int:
+  g_inited = 1
+  ret 0
+
+fn is_inited() -> int:
+  ret g_inited

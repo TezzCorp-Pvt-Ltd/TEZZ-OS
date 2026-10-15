@@ -1,0 +1,86 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — Serial (COM1) Debug Driver (drivers/serial.tn)
+// ═══════════════════════════════════════════════════════════════
+//
+//  Initialises COM1 (0x3F8) and provides log(), print(), putc().
+//  All kernel debug output goes here. Works in QEMU/VirtualBox
+//  by routing -serial stdio.
+// ═══════════════════════════════════════════════════════════════
+
+import "sys"
+
+let COM1:int = 0x3F8
+
+fn init(baud:int) -> int:
+  divisor:int = 115200 / baud
+  sys.sys_outb(COM1 + 1, 0x00)          // Disable interrupts
+  sys.sys_outb(COM1 + 3, 0x80)          // Enable DLAB
+  sys.sys_outb(COM1 + 0, divisor & 0xFF)
+  sys.sys_outb(COM1 + 1, (divisor >> 8) & 0xFF)
+  sys.sys_outb(COM1 + 3, 0x03)          // 8 bits, no parity, one stop
+  sys.sys_outb(COM1 + 2, 0xC7)          // FIFO control
+  sys.sys_outb(COM1 + 4, 0x0B)          // IRQs, RTS/DSR set
+  ret 0
+
+fn _tx_ready() -> int:
+  ret (sys.sys_inb(COM1 + 5) & 0x20) != 0
+
+fn has_char() -> int:
+  ret (sys.sys_inb(COM1 + 5) & 1) != 0
+
+fn getc() -> int:
+  if (sys.sys_inb(COM1 + 5) & 1) == 0: ret (0 - 1)
+  ret sys.sys_inb(COM1) & 0xFF
+
+fn putc(ch:int) -> int:
+  while (sys.sys_inb(COM1 + 5) & 0x20) == 0:
+    1
+  sys.sys_outb(COM1, ch)
+  ret 0
+
+fn print(s:str) -> int:
+  if s == 0: ret 0
+  unsafe:
+    p:*char = s as *char
+    i:int = 0
+    while p[i] != 0 as char:
+      putc(p[i] as int)
+      i = i + 1
+  ret 0
+
+fn log(module:str, msg:str) -> int:
+  print("[")
+  print(module)
+  print("] ")
+  print(msg)
+  print("\r\n")
+  ret 0
+
+fn print_hex(n:int) -> int:
+  print("0x")
+  hex:str = "0123456789ABCDEF"
+  unsafe:
+    hc:*char = hex as *char
+    i:int = 60
+    while i >= 0:
+      putc(hc[(n >> i) & 0xF] as int)
+      i = i - 4
+  ret 0
+
+fn print_int(n:int) -> int:
+  if n == 0:
+    putc(48)
+    ret 0
+  if n < 0:
+    putc(45)
+    n = 0 - n
+  digits:[int;20]
+  count:int = 0
+  while n > 0:
+    unsafe: digits[count] = n % 10
+    n = n / 10
+    count = count + 1
+  while count > 0:
+    count = count - 1
+    unsafe: putc(48 + digits[count])
+  ret 0

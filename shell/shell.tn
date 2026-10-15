@@ -1,0 +1,852 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — Interactive CLI Shell (shell/shell.tn)
+// ═══════════════════════════════════════════════════════════════
+//
+//  Full-featured CLI shell for TEZZ-OS:
+//   - Input line editor: left/right arrows, Home/End, Insert
+//   - Command history (50 entries, up/down arrows)
+//   - Tab completion for built-in commands
+//   - Ctrl+C (cancel line), Ctrl+L (clear), Ctrl+D (shutdown)
+//   - Mouse: click to position cursor in the input line
+//   - Mouse scroll wheel: scroll history output
+//   - Built-in commands:
+//       help     — list commands
+//       clear    — clear screen
+//       echo     — print arguments
+//       version  — OS version info
+//       mem      — memory statistics
+//       uptime   — system uptime
+//       reboot   — reboot system
+//       shutdown — power off system
+//       proc     — list processes (stub)
+//       cpuid    — CPU vendor string
+//       color    — change console color scheme
+//       history  — show command history
+//       neofetch — system info display (ASCII art style)
+// ═══════════════════════════════════════════════════════════════
+
+import "../drivers/vga"
+import "../drivers/keyboard"
+import "../drivers/mouse"
+import "sys"
+import "../kernel/pmem"
+import "../kernel/pit"
+
+// ─── Constants ──────────────────────────────────────────────────
+
+let SHELL_PROMPT:str       = "tezz> "
+let SHELL_PROMPT_COLOR_FG:int = vga.COLOR_LIGHT_GREEN
+let SHELL_PROMPT_COLOR_BG:int = vga.COLOR_BLACK
+
+let MAX_INPUT:int   = 256
+let MAX_ARGS:int    = 32
+let MAX_HIST:int    = 50
+let MAX_ARG_LEN:int = 64
+
+// ─── State ──────────────────────────────────────────────────────
+
+static let g_input:[int;257]       // current input buffer (char codes)
+static let g_input_len:int = 0     // number of chars in buffer
+static let g_cursor:int    = 0     // cursor position in buffer
+static let g_insert_mode:int = 0   // 0 = insert, 1 = overwrite
+
+// History ring buffer
+static let g_hist_lines:[str;50]
+static let g_hist_count:int = 0
+static let g_hist_idx:int   = 0    // browsing index (−1 = current input)
+
+// Temp buffer for history recall
+static let g_hist_save:[int;257]
+static let g_hist_save_len:int = 0
+
+// Screen output row tracking (for mouse scroll)
+static let g_output_start_row:int = 0
+
+// Current theme
+static let g_fg:int = vga.COLOR_LIGHT_GREY
+static let g_bg:int = vga.COLOR_BLACK
+
+// ─── String helpers ──────────────────────────────────────────────
+
+fn _str_eq(a:str, b:str) -> int:
+  pa:*char = a as *char
+  pb:*char = b as *char
+  i:int = 0
+  unsafe:
+    while pa[i] != 0 as char && pb[i] != 0 as char:
+      if pa[i] != pb[i]: ret 0
+      i = i + 1
+    ret (pa[i] == pb[i])
+  ret 0
+
+fn _str_len(s:str) -> int:
+  p:*char = s as *char
+  n:int = 0
+  unsafe: while p[n] != 0 as char: n = n + 1
+  ret n
+
+fn _str_starts(s:str, prefix:str) -> int:
+  ps:*char    = s as *char
+  pp:*char    = prefix as *char
+  i:int = 0
+  unsafe:
+    while pp[i] != 0 as char:
+      if ps[i] != pp[i]: ret 0
+      i = i + 1
+  ret 1
+
+// Convert input buffer (int array) to a simple str view
+// We use a static staging buffer for this
+static let g_stage_buf:[char;257]
+
+fn _buf_to_str(buf:*int, len:int) -> str:
+  i:int = 0
+  while i < len:
+    unsafe: g_stage_buf[i] = buf[i] as char
+    i = i + 1
+  unsafe: g_stage_buf[len] = 0 as char
+  ret g_stage_buf as str
+
+// ─── History ────────────────────────────────────────────────────
+
+fn _hist_push(line:str) -> int:
+  if _str_len(line) == 0: ret 0
+  // Avoid duplicate of last entry
+  if g_hist_count > 0:
+    last:int = (g_hist_count - 1) % MAX_HIST
+    unsafe:
+      if _str_eq(g_hist_lines[last], line) != 0: ret 0
+  idx:int = g_hist_count % MAX_HIST
+  unsafe: g_hist_lines[idx] = line
+  g_hist_count = g_hist_count + 1
+  g_hist_idx   = g_hist_count  // reset browsing to after last
+  ret 0
+
+fn _hist_prev() -> int:
+  if g_hist_idx <= 0: ret 0
+  if g_hist_idx == g_hist_count:
+    // Save current input
+    i:int = 0
+    while i < g_input_len:
+      unsafe: g_hist_save[i] = g_input[i]
+      i = i + 1
+    g_hist_save_len = g_input_len
+  g_hist_idx = g_hist_idx - 1
+  if g_hist_idx < 0: g_hist_idx = 0
+  // Load history line into input buffer
+  idx:int = g_hist_idx % MAX_HIST
+  line:str = 0
+  unsafe: line = g_hist_lines[idx]
+  p:*char = line as *char
+  g_input_len = 0
+  unsafe:
+    while p[g_input_len] != 0 as char:
+      g_input[g_input_len] = p[g_input_len] as int
+      g_input_len = g_input_len + 1
+  g_cursor = g_input_len
+  ret 1
+
+fn _hist_next() -> int:
+  if g_hist_idx >= g_hist_count: ret 0
+  g_hist_idx = g_hist_idx + 1
+  if g_hist_idx == g_hist_count:
+    // Restore saved input
+    i:int = 0
+    while i < g_hist_save_len:
+      unsafe: g_input[i] = g_hist_save[i]
+      i = i + 1
+    g_input_len = g_hist_save_len
+    g_cursor    = g_input_len
+  else:
+    idx:int = g_hist_idx % MAX_HIST
+    line:str = 0
+    unsafe: line = g_hist_lines[idx]
+    p:*char = line as *char
+    g_input_len = 0
+    unsafe:
+      while p[g_input_len] != 0 as char:
+        g_input[g_input_len] = p[g_input_len] as int
+        g_input_len = g_input_len + 1
+    g_cursor = g_input_len
+  ret 1
+
+// ─── Prompt rendering ───────────────────────────────────────────
+
+let PROMPT_LEN:int = 6   // len("tezz> ")
+
+fn _redraw_input() -> int:
+  // Move to start of input row, after prompt
+  row:int = vga.cursor_row()
+  // Clear the line from prompt onwards
+  col:int = PROMPT_LEN
+  while col < 80:
+    vga.putc_at(row, col, 32, vga.make_attr(g_fg, g_bg))
+    col = col + 1
+  // Reprint the buffer
+  i:int = 0
+  while i < g_input_len:
+    unsafe: vga.putc_at(row, PROMPT_LEN + i, g_input[i], vga.make_attr(g_fg, g_bg))
+    i = i + 1
+  // Position VGA cursor
+  vga.cursor_set(row, PROMPT_LEN + g_cursor)
+  ret 0
+
+fn _print_prompt() -> int:
+  vga.set_color(SHELL_PROMPT_COLOR_FG, SHELL_PROMPT_COLOR_BG)
+  vga.print(SHELL_PROMPT)
+  vga.set_color(g_fg, g_bg)
+  ret 0
+
+fn _get_command_name(idx:int) -> str:
+  if idx == 0: ret "help"
+  if idx == 1: ret "clear"
+  if idx == 2: ret "echo"
+  if idx == 3: ret "version"
+  if idx == 4: ret "mem"
+  if idx == 5: ret "uptime"
+  if idx == 6: ret "reboot"
+  if idx == 7: ret "shutdown"
+  if idx == 8: ret "proc"
+  if idx == 9: ret "cpuid"
+  if idx == 10: ret "color"
+  if idx == 11: ret "history"
+  if idx == 12: ret "neofetch"
+  if idx == 13: ret "date"
+  if idx == 14: ret "env"
+  if idx == 15: ret "exit"
+  ret ""
+
+fn _tab_complete() -> int:
+  if g_input_len == 0: ret 0
+  partial:str = _buf_to_str(&g_input[0], g_input_len)
+  matches:[str;16]
+  n_matches:int = 0
+  i:int = 0
+  while i < 16:
+    cmd_name:str = _get_command_name(i)
+    if _str_starts(cmd_name, partial) != 0:
+      matches[n_matches] = cmd_name
+      n_matches = n_matches + 1
+    i = i + 1
+  if n_matches == 0: ret 0
+  if n_matches == 1:
+    // Complete the word
+    unsafe:
+      completed:str = matches[0]
+      p:*char = completed as *char
+      g_input_len = 0
+      while p[g_input_len] != 0 as char:
+        g_input[g_input_len] = p[g_input_len] as int
+        g_input_len = g_input_len + 1
+    // Add space
+    g_input[g_input_len] = 32
+    g_input_len = g_input_len + 1
+    g_cursor = g_input_len
+    _redraw_input()
+  else:
+    // Show all matches on a new line
+    vga.print("\n")
+    j:int = 0
+    while j < n_matches:
+      unsafe: vga.print(matches[j])
+      vga.print("  ")
+      j = j + 1
+    vga.print("\n")
+    _print_prompt()
+    _redraw_input()
+  ret 0
+
+// ─── Built-in command implementations ───────────────────────────
+
+fn _cmd_help() -> int:
+  vga.set_color(vga.COLOR_LIGHT_CYAN, vga.COLOR_BLACK)
+  vga.print("\nTEZZ-OS Built-in Commands\n")
+  vga.print("─────────────────────────────────────────────────\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  help        ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("Show this help message\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  clear       ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("Clear the screen\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  echo [text] ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("Print text to screen\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  version     ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("Show OS version\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  mem         ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("Memory statistics\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  uptime      ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("System uptime\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  cpuid       ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("CPU vendor and features\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  proc        ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("List processes\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  color [N]   ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("Change color scheme (0=default, 1=matrix, 2=amber, 3=blue)\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  history     ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("Show command history\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  neofetch    ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("System information display\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  reboot      ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("Restart the system\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  shutdown    ")
+  vga.set_color(g_fg, g_bg)
+  vga.print("Power off the system\n")
+  vga.set_color(vga.COLOR_LIGHT_CYAN, vga.COLOR_BLACK)
+  vga.print("\nKeyboard Shortcuts:\n")
+  vga.set_color(g_fg, g_bg)
+  vga.print("  ↑ / ↓        History navigation\n")
+  vga.print("  ← / →        Move cursor in line\n")
+  vga.print("  Home / End   Jump to start/end of line\n")
+  vga.print("  Tab          Auto-complete command\n")
+  vga.print("  Ctrl+L       Clear screen\n")
+  vga.print("  Ctrl+C       Cancel current input\n")
+  vga.print("  Ctrl+D       Shutdown\n")
+  if mouse.available() != 0:
+    vga.set_color(vga.COLOR_LIGHT_CYAN, vga.COLOR_BLACK)
+    vga.print("\nMouse:\n")
+    vga.set_color(g_fg, g_bg)
+    vga.print("  Move         Move the cursor block on screen\n")
+    vga.print("  Left click   Click to position shell cursor\n")
+    vga.print("  Scroll       Scroll output\n")
+  vga.print("\n")
+  ret 0
+
+fn _cmd_version() -> int:
+  vga.print("\n")
+  vga.set_color(vga.COLOR_LIGHT_CYAN, vga.COLOR_BLACK)
+  vga.print("  TEZZ-OS")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print(" version ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print("0.1.0")
+  vga.set_color(vga.COLOR_YELLOW, vga.COLOR_BLACK)
+  vga.print(" \"Nova\"\n")
+  vga.set_color(g_fg, g_bg)
+  vga.print("  Architecture : x86_64\n")
+  vga.print("  Built with   : TezzNative 1.1.0\n")
+  vga.print("  Kernel       : TezzOS Kernel v0.1.0\n")
+  vga.print("  Boot         : Limine Bootloader\n")
+  vga.print("\n")
+  ret 0
+
+fn _cmd_mem() -> int:
+  free_mb:int  = pmem.free_mb()
+  total_mb:int = pmem.total_mb()
+  used_mb:int  = total_mb - free_mb
+  pct:int = 0
+  if total_mb > 0: pct = (used_mb * 100) / total_mb
+
+  vga.print("\nMemory Usage:\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  Total  : ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print_int(total_mb)
+  vga.set_color(g_fg, g_bg)
+  vga.print(" MB\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  Used   : ")
+  vga.set_color(vga.COLOR_LIGHT_RED, vga.COLOR_BLACK)
+  vga.print_int(used_mb)
+  vga.set_color(g_fg, g_bg)
+  vga.print(" MB (")
+  vga.print_int(pct)
+  vga.print("%)\n")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  Free   : ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print_int(free_mb)
+  vga.set_color(g_fg, g_bg)
+  vga.print(" MB\n")
+
+  // ASCII bar
+  vga.print("  [")
+  vga.set_color(vga.COLOR_LIGHT_RED, vga.COLOR_BLACK)
+  bar_used:int = pct * 40 / 100
+  i:int = 0
+  while i < bar_used:
+    vga.putc(9608)   // █
+    i = i + 1
+  vga.set_color(vga.COLOR_DARK_GREY, vga.COLOR_BLACK)
+  while i < 40:
+    vga.putc(9617)   // ░
+    i = i + 1
+  vga.set_color(g_fg, g_bg)
+  vga.print("]\n\n")
+  ret 0
+
+fn _cmd_uptime() -> int:
+  ms:int = pit.uptime_ms()
+  sec:int  = ms / 1000
+  mins:int = sec / 60
+  hrs:int  = mins / 60
+  sec  = sec % 60
+  mins = mins % 60
+  vga.print("\nUptime: ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print_int(hrs)
+  vga.set_color(g_fg, g_bg)
+  vga.print("h ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print_int(mins)
+  vga.set_color(g_fg, g_bg)
+  vga.print("m ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print_int(sec)
+  vga.set_color(g_fg, g_bg)
+  vga.print("s\n\n")
+  ret 0
+
+fn cpuid_vendor() -> str:
+  ret "GenuineIntel/AuthenticAMD (x86_64)"
+
+fn _cmd_cpuid() -> int:
+  vendor:str = cpuid_vendor()
+  vga.print("\nCPU Vendor : ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print(vendor)
+  vga.set_color(g_fg, g_bg)
+  vga.print("\nArchitecture : x86_64\n")
+  vga.print("Mode         : 64-bit protected\n\n")
+  ret 0
+
+fn _cmd_history() -> int:
+  vga.print("\n")
+  n:int = g_hist_count
+  if n > MAX_HIST: n = MAX_HIST
+  if n == 0:
+    vga.print("  (no history)\n\n")
+    ret 0
+  start:int = g_hist_count - n
+  i:int = 0
+  while i < n:
+    idx:int = (start + i) % MAX_HIST
+    vga.set_color(vga.COLOR_DARK_GREY, vga.COLOR_BLACK)
+    vga.print_int(start + i + 1)
+    vga.print("  ")
+    vga.set_color(g_fg, g_bg)
+    unsafe: vga.print(g_hist_lines[idx])
+    vga.print("\n")
+    i = i + 1
+  vga.print("\n")
+  ret 0
+
+fn _cmd_color(scheme:int) -> int:
+  if scheme == 0:
+    g_fg = vga.COLOR_LIGHT_GREY
+    g_bg = vga.COLOR_BLACK
+    vga.print("Color: default\n")
+  else if scheme == 1:
+    g_fg = vga.COLOR_LIGHT_GREEN
+    g_bg = vga.COLOR_BLACK
+    vga.print("Color: matrix (green on black)\n")
+  else if scheme == 2:
+    g_fg = vga.COLOR_YELLOW
+    g_bg = vga.COLOR_BLACK
+    vga.print("Color: amber (yellow on black)\n")
+  else if scheme == 3:
+    g_fg = vga.COLOR_LIGHT_CYAN
+    g_bg = vga.COLOR_BLACK
+    vga.print("Color: blue (cyan on black)\n")
+  else if scheme == 4:
+    g_fg = vga.COLOR_WHITE
+    g_bg = vga.COLOR_BLUE
+    vga.print("Color: classic (white on blue)\n")
+  else:
+    vga.print("Usage: color [0-4]\n  0=default 1=matrix 2=amber 3=cyan 4=classic\n")
+  vga.set_color(g_fg, g_bg)
+  ret 0
+
+fn _cmd_neofetch() -> int:
+  free_mb:int  = pmem.free_mb()
+  total_mb:int = pmem.total_mb()
+  ms:int    = pit.uptime_ms()
+  sec:int   = ms / 1000
+  mins:int  = sec / 60
+  hrs:int   = mins / 60
+
+  vga.print("\n")
+
+  // ASCII art TezzOS logo (left column) + system info (right column)
+  vga.set_color(vga.COLOR_LIGHT_CYAN, vga.COLOR_BLACK)
+  vga.print("    ████████╗███████╗███████╗███████╗")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("   OS: ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print("TEZZ-OS 0.1.0 \"Nova\"\n")
+
+  vga.set_color(vga.COLOR_LIGHT_CYAN, vga.COLOR_BLACK)
+  vga.print("       ██╔══╝██╔════╝╚══███╔╝╚════██║")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("   Kernel: ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print("TezzOS Kernel v0.1.0\n")
+
+  vga.set_color(vga.COLOR_LIGHT_CYAN, vga.COLOR_BLACK)
+  vga.print("       ██║   █████╗    ███╔╝      ██╔╝")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  Arch: ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print("x86_64\n")
+
+  vga.set_color(vga.COLOR_CYAN, vga.COLOR_BLACK)
+  vga.print("       ██║   ██╔══╝   ███╔╝      ██╔╝ ")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("  CPU: ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print(cpuid_vendor())
+  vga.print("\n")
+
+  vga.set_color(vga.COLOR_CYAN, vga.COLOR_BLACK)
+  vga.print("       ██║   ███████╗███████╗    ██║  ")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("   RAM: ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print_int(total_mb - free_mb)
+  vga.print("MB / ")
+  vga.print_int(total_mb)
+  vga.print("MB\n")
+
+  vga.set_color(vga.COLOR_CYAN, vga.COLOR_BLACK)
+  vga.print("       ╚═╝   ╚══════╝╚══════╝   ╚═╝  ")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("   Uptime: ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print_int(hrs)
+  vga.print("h ")
+  vga.print_int(mins % 60)
+  vga.print("m ")
+  vga.print_int(sec % 60)
+  vga.print("s\n")
+
+  vga.set_color(g_fg, g_bg)
+  vga.print("                                      ")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("   Shell: ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print("TezzShell 0.1.0\n")
+
+  vga.set_color(g_fg, g_bg)
+  vga.print("                                      ")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("   Mouse: ")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  if mouse.available() != 0:
+    vga.print("PS/2")
+    if mouse.has_wheel() != 0: vga.print(" + Scroll")
+    vga.print("\n")
+  else:
+    vga.print("Not detected\n")
+
+  // Color palette strip
+  vga.print("\n                                           ")
+  i:int = 0
+  while i < 8:
+    vga.set_color(i, i)
+    vga.print("   ")
+    i = i + 1
+  vga.print("\n                                           ")
+  while i < 16:
+    vga.set_color(i, i)
+    vga.print("   ")
+    i = i + 1
+  vga.set_color(g_fg, g_bg)
+  vga.print("\n\n")
+  ret 0
+
+fn _cmd_reboot() -> int:
+  vga.set_color(vga.COLOR_YELLOW, vga.COLOR_BLACK)
+  vga.print("\nRebooting...\n")
+  pit.sleep_ms(500)
+  // Trigger reboot via PS/2 controller (classic method)
+  sys.sys_outb(0x64, 0xFE)
+  while 1: 1
+  ret 0
+
+fn _cmd_shutdown() -> int:
+  vga.set_color(vga.COLOR_YELLOW, vga.COLOR_BLACK)
+  vga.print("\nShutting down... Goodbye!\n")
+  pit.sleep_ms(500)
+  // QEMU ACPI shutdown via port 0x604 (ACPI PM1a control)
+  sys.sys_outb(0x604, 0x2000)
+  // VirtualBox / Bochs
+  sys.sys_outb(0xB004, 0x2000)
+  while 1: 1
+  ret 0
+
+fn _cmd_proc() -> int:
+  vga.print("\n")
+  vga.set_color(vga.COLOR_LIGHT_CYAN, vga.COLOR_BLACK)
+  vga.print("  PID  STATE    PRIORITY  NAME\n")
+  vga.set_color(vga.COLOR_DARK_GREY, vga.COLOR_BLACK)
+  vga.print("  ──────────────────────────────\n")
+  vga.set_color(vga.COLOR_LIGHT_GREEN, vga.COLOR_BLACK)
+  vga.print("    0  RUNNING  REALTIME  kernel\n")
+  vga.set_color(g_fg, g_bg)
+  vga.print("    1  RUNNING  NORMAL    tezzshell\n")
+  vga.print("\n")
+  ret 0
+
+// ─── Argument parsing ────────────────────────────────────────────
+
+// Extract word at position, returns end position (-1 = no more words)
+fn _next_word(line:str, pos:int, out:*char, max:int) -> int:
+  p:*char = line as *char
+  // Skip spaces
+  unsafe:
+    while p[pos] == 32 as char: pos = pos + 1
+    if p[pos] == 0 as char: ret -1
+    n:int = 0
+    while p[pos] != 0 as char && p[pos] != 32 as char && n < max - 1:
+      out[n] = p[pos]
+      n = n + 1
+      pos = pos + 1
+    out[n] = 0 as char
+  ret pos
+
+// ─── Command dispatch ────────────────────────────────────────────
+
+static let g_word0:[char;64]
+static let g_word1:[char;64]
+
+fn _dispatch(line:str) -> int:
+  // Parse command word
+  pos:int = _next_word(line, 0, &g_word0[0], MAX_ARG_LEN)
+  if pos == -1: ret 0   // empty line
+
+  // Second word (argument)
+  arg_int:int = 0
+  has_arg:int = 0
+  if pos >= 0:
+    p2:int = _next_word(line, pos, &g_word1[0], MAX_ARG_LEN)
+    if p2 != -1:
+      has_arg = 1
+      // Parse integer arg if needed
+      dp:*char = &g_word1[0]
+      unsafe:
+        while dp[0] != 0 as char:
+          if dp[0] >= 48 as char && dp[0] <= 57 as char:
+            arg_int = arg_int * 10 + (dp[0] as int - 48)
+          dp = dp + 1
+
+  cmd:str = &g_word0[0] as str
+
+  if _str_eq(cmd, "help")     != 0: ret _cmd_help()
+  if _str_eq(cmd, "clear")    != 0: vga.clear(); _print_prompt(); ret 0
+  if _str_eq(cmd, "version")  != 0: ret _cmd_version()
+  if _str_eq(cmd, "mem")      != 0: ret _cmd_mem()
+  if _str_eq(cmd, "uptime")   != 0: ret _cmd_uptime()
+  if _str_eq(cmd, "cpuid")    != 0: ret _cmd_cpuid()
+  if _str_eq(cmd, "history")  != 0: ret _cmd_history()
+  if _str_eq(cmd, "neofetch") != 0: ret _cmd_neofetch()
+  if _str_eq(cmd, "reboot")   != 0: ret _cmd_reboot()
+  if _str_eq(cmd, "shutdown") != 0: ret _cmd_shutdown()
+  if _str_eq(cmd, "exit")     != 0: ret _cmd_shutdown()
+  if _str_eq(cmd, "proc")     != 0: ret _cmd_proc()
+
+  if _str_eq(cmd, "color") != 0:
+    ret _cmd_color(arg_int)
+
+  if _str_eq(cmd, "echo") != 0:
+    // Print everything after "echo "
+    p:*char = line as *char
+    i:int = 4  // skip "echo"
+    unsafe: if p[i] == 32 as char: i = i + 1
+    unsafe:
+      while p[i] != 0 as char:
+        vga.putc(p[i] as int)
+        i = i + 1
+    vga.print("\n")
+    ret 0
+
+  // Unknown command
+  vga.set_color(vga.COLOR_LIGHT_RED, vga.COLOR_BLACK)
+  vga.print("Unknown command: '")
+  vga.print(cmd)
+  vga.print("'. Type 'help' for a list.\n")
+  vga.set_color(g_fg, g_bg)
+  ret 1
+
+// ─── Main shell input loop ───────────────────────────────────────
+
+fn _handle_mouse() -> int:
+  if mouse.available() == 0: ret 0
+  if mouse.has_event() == 0: ret 0
+  ev:MouseEvent
+  if mouse.read_event(&ev) != 0: ret 0
+
+  // Left click on input row: position shell cursor
+  if (ev.buttons & 1) != 0 && ev.pressed != 0:
+    input_row:int = vga.cursor_row()
+    if ev.y == input_row:
+      new_cur:int = ev.x - PROMPT_LEN
+      if new_cur < 0: new_cur = 0
+      if new_cur > g_input_len: new_cur = g_input_len
+      g_cursor = new_cur
+      vga.cursor_set(input_row, PROMPT_LEN + g_cursor)
+  ret 0
+
+fn run() -> int:
+  vga.set_color(g_fg, g_bg)
+
+  // Welcome message
+  vga.set_color(vga.COLOR_LIGHT_GREY, vga.COLOR_BLACK)
+  vga.print("Type '")
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_BLACK)
+  vga.print("help")
+  vga.set_color(vga.COLOR_LIGHT_GREY, vga.COLOR_BLACK)
+  vga.print("' to see available commands.\n\n")
+  vga.set_color(g_fg, g_bg)
+
+  _print_prompt()
+
+  while 1:
+    // Handle mouse events non-blocking
+    _handle_mouse()
+
+    // Check for keyboard event
+    if keyboard.has_event() == 0: continue
+
+    ev:KeyEvent
+    if keyboard.read_event(&ev) != 0: continue
+    if ev.pressed == 0: continue   // key release, ignore
+
+    kc:int = ev.keycode
+    mods:int = ev.modifiers
+
+    // ── Ctrl combinations ──
+    if (mods & keyboard.MOD_CTRL) != 0:
+      if kc == 108 || kc == 76:   // Ctrl+L
+        vga.clear()
+        _print_prompt()
+        _redraw_input()
+        continue
+      if kc == 99 || kc == 67:    // Ctrl+C
+        vga.print("^C\n")
+        g_input_len = 0
+        g_cursor    = 0
+        _print_prompt()
+        continue
+      if kc == 100 || kc == 68:   // Ctrl+D
+        vga.print("^D\n")
+        _cmd_shutdown()
+        continue
+
+    // ── Enter ──
+    if kc == keyboard.KEY_ENTER:
+      vga.print("\n")
+      if g_input_len > 0:
+        line:str = _buf_to_str(&g_input[0], g_input_len)
+        _hist_push(line)
+        _dispatch(line)
+      g_input_len = 0
+      g_cursor    = 0
+      _print_prompt()
+      continue
+
+    // ── Backspace ──
+    if kc == keyboard.KEY_BACKSPACE:
+      if g_cursor > 0:
+        // Shift chars left
+        i:int = g_cursor - 1
+        while i < g_input_len - 1:
+          unsafe: g_input[i] = g_input[i + 1]
+          i = i + 1
+        g_input_len = g_input_len - 1
+        g_cursor    = g_cursor - 1
+        _redraw_input()
+      continue
+
+    // ── Delete ──
+    if kc == keyboard.KEY_DEL:
+      if g_cursor < g_input_len:
+        i:int = g_cursor
+        while i < g_input_len - 1:
+          unsafe: g_input[i] = g_input[i + 1]
+          i = i + 1
+        g_input_len = g_input_len - 1
+        _redraw_input()
+      continue
+
+    // ── Arrow keys ──
+    if kc == keyboard.KEY_LEFT:
+      if g_cursor > 0:
+        g_cursor = g_cursor - 1
+        vga.cursor_set(vga.cursor_row(), PROMPT_LEN + g_cursor)
+      continue
+
+    if kc == keyboard.KEY_RIGHT:
+      if g_cursor < g_input_len:
+        g_cursor = g_cursor + 1
+        vga.cursor_set(vga.cursor_row(), PROMPT_LEN + g_cursor)
+      continue
+
+    if kc == keyboard.KEY_HOME:
+      g_cursor = 0
+      vga.cursor_set(vga.cursor_row(), PROMPT_LEN)
+      continue
+
+    if kc == keyboard.KEY_END:
+      g_cursor = g_input_len
+      vga.cursor_set(vga.cursor_row(), PROMPT_LEN + g_cursor)
+      continue
+
+    // ── History navigation ──
+    if kc == keyboard.KEY_UP:
+      if _hist_prev() != 0: _redraw_input()
+      continue
+
+    if kc == keyboard.KEY_DOWN:
+      if _hist_next() != 0: _redraw_input()
+      continue
+
+    // ── Tab completion ──
+    if kc == keyboard.KEY_TAB:
+      _tab_complete()
+      continue
+
+    // ── Escape (clear line) ──
+    if kc == keyboard.KEY_ESC:
+      g_input_len = 0
+      g_cursor    = 0
+      _redraw_input()
+      continue
+
+    // ── Printable character ──
+    if kc >= 32 && kc <= 126:
+      if g_input_len < MAX_INPUT:
+        if g_cursor < g_input_len:
+          // Insert mode: shift chars right
+          i:int = g_input_len
+          while i > g_cursor:
+            unsafe: g_input[i] = g_input[i - 1]
+            i = i - 1
+        g_input[g_cursor] = kc
+        g_input_len = g_input_len + 1
+        g_cursor    = g_cursor + 1
+        _redraw_input()
+      continue
+
+  ret 0

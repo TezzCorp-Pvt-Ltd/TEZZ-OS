@@ -1,0 +1,17 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — Kernel Panic Helper (kernel/panic.tn)
+// ═══════════════════════════════════════════════════════════════
+
+import "../drivers/vga"
+
+fn panic(msg:str) -> int:
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_RED)
+  vga.print("\n\n *** TEZZ-OS KERNEL PANIC ***\n ")
+  vga.print(msg)
+  vga.print("\n System halted. Reboot required.\n")
+  while 1: 1
+  ret 0
+
+fn assert(cond:int, msg:str) -> int:
+  if cond == 0: panic(msg)
+  ret 0

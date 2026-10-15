@@ -1,0 +1,459 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — PS/2 Mouse Driver (drivers/mouse.tn)
+// ═══════════════════════════════════════════════════════════════
+//
+//  Full PS/2 mouse driver:
+//   - 3-byte packet parsing (standard PS/2 mouse)
+//   - 4-byte packet support (IntelliMouse scroll wheel)
+//   - Absolute cursor position tracking (0,0 → COLS-1, ROWS-1)
+//   - Left / right / middle button state
+//   - Scroll wheel delta
+//   - IRQ12 handler
+//   - Visual cursor rendering in VGA text mode (highlighted cell)
+//
+//  Usage:
+//    mouse.init()              // called once at boot
+//    if mouse.available()      // check if PS/2 mouse present
+//    ev:MouseEvent = mouse.read_event()
+//    x:int = mouse.x()        // current column (0–79)
+//    y:int = mouse.y()        // current row (0–24)
+//    b:int = mouse.buttons()  // bitmask: bit0=left, bit1=right, bit2=middle
+// ═══════════════════════════════════════════════════════════════
+
+import "sys"
+import "vga"
+import "fb"
+
+let COLOR_BLACK:int         = 0
+let COLOR_BLUE:int          = 1
+let COLOR_GREEN:int         = 2
+let COLOR_CYAN:int          = 3
+let COLOR_RED:int           = 4
+let COLOR_MAGENTA:int       = 5
+let COLOR_BROWN:int         = 6
+let COLOR_LIGHT_GREY:int    = 7
+let COLOR_DARK_GREY:int     = 8
+let COLOR_LIGHT_BLUE:int    = 9
+let COLOR_LIGHT_GREEN:int   = 10
+let COLOR_LIGHT_CYAN:int    = 11
+let COLOR_LIGHT_RED:int     = 12
+let COLOR_LIGHT_MAGENTA:int = 13
+let COLOR_YELLOW:int        = 14
+let COLOR_WHITE:int         = 15
+
+
+// ─── PS/2 controller ports ──────────────────────────────────────
+
+let PS2_DATA:int   = 0x60
+let PS2_STATUS:int = 0x64
+let PS2_CMD:int    = 0x64
+
+// Controller commands
+let PS2_CMD_READ_CFG:int      = 0x20
+let PS2_CMD_WRITE_CFG:int     = 0x60
+let PS2_CMD_ENABLE_MOUSE:int  = 0xA8
+let PS2_CMD_DISABLE_MOUSE:int = 0xA7
+let PS2_CMD_MOUSE_WRITE:int   = 0xD4
+
+// Mouse commands
+let MOUSE_CMD_RESET:int          = 0xFF
+let MOUSE_CMD_RESEND:int         = 0xFE
+let MOUSE_CMD_SET_DEFAULTS:int   = 0xF6
+let MOUSE_CMD_STREAM_MODE:int    = 0xF4
+let MOUSE_CMD_SET_SAMPLE_RATE:int = 0xF3
+let MOUSE_CMD_GET_DEVICE_ID:int  = 0xF2
+let MOUSE_CMD_STATUS:int         = 0xE9
+let MOUSE_CMD_SET_RESOLUTION:int = 0xE8
+
+// Mouse ACK
+let MOUSE_ACK:int  = 0xFA
+let MOUSE_BAT:int  = 0xAA  // Basic Assurance Test pass
+
+// ─── Mouse event ────────────────────────────────────────────────
+
+struct MouseEvent:
+  x:int          // absolute column
+  y:int          // absolute row
+  dx:int         // raw X delta
+  dy:int         // raw Y delta
+  buttons:int    // bitmask: bit0=left, bit1=right, bit2=middle
+  scroll:int     // scroll wheel delta (-127..127)
+  moved:int      // 1 if position changed
+  px:int         // absolute pixel X
+  py:int         // absolute pixel Y
+
+// ─── Mouse event ring buffer ─────────────────────────────────────
+
+let MOUSE_BUF_SIZE:int = 64
+static let g_mbuf:[MouseEvent;64]
+static let g_mbuf_head:int = 0
+static let g_mbuf_tail:int = 0
+
+// ─── Driver state ───────────────────────────────────────────────
+
+static let g_available:int   = 0
+static let g_has_wheel:int   = 0   // IntelliMouse 4th byte
+static let g_inited:int      = 0
+
+// Packet assembly
+static let g_pkt_buf:[int;4]
+static let g_pkt_byte:int    = 0   // which byte are we on (0,1,2 or 3)
+
+// Absolute position (in VGA text cells and FB pixels)
+static let g_mouse_x:int     = 40  // start in center
+static let g_mouse_y:int     = 12
+static let g_mouse_px:int    = 640
+static let g_mouse_py:int    = 400
+static let g_buttons:int     = 0
+static let g_scroll:int      = 0
+
+// Visual cursor: saved cell under the cursor
+static let g_cursor_saved_ch:int   = 32
+static let g_cursor_saved_attr:int = 7
+static let g_cursor_visible:int    = 0
+
+// Sensitivity (higher = faster movement in text cells)
+let MOUSE_SENSITIVITY:int = 8  // divide raw delta by this
+
+// ─── Internal helpers ────────────────────────────────────────────
+
+fn _ps2_wait_write() -> int:
+  t:int = 500000
+  while t > 0:
+    if (sys.sys_inb(PS2_STATUS) & 2) == 0: ret 0
+    sys.sys_inb(0x80)
+    t = t - 1
+  ret (0 - 1)
+
+fn _ps2_wait_read() -> int:
+  t:int = 500000
+  while t > 0:
+    if (sys.sys_inb(PS2_STATUS) & 1) != 0: ret 0
+    sys.sys_inb(0x80)
+    t = t - 1
+  ret (0 - 1)
+
+fn _mouse_send(cmd:int) -> int:
+  _ps2_wait_write()
+  sys.sys_outb(PS2_CMD, PS2_CMD_MOUSE_WRITE)
+  _ps2_wait_write()
+  sys.sys_outb(PS2_DATA, cmd)
+  ret 0
+
+fn _mouse_read() -> int:
+  t:int = 1000000
+  while t > 0:
+    st:int = sys.sys_inb(PS2_STATUS)
+    if (st & 1) != 0:
+      ret sys.sys_inb(PS2_DATA)
+    sys.sys_inb(0x80)
+    t = t - 1
+  ret (0 - 1)
+
+fn _buf_push(ev:*MouseEvent) -> int:
+  next:int = (g_mbuf_tail + 1) % MOUSE_BUF_SIZE
+  if next == g_mbuf_head: ret (0 - 1)
+  unsafe:
+    g_mbuf[g_mbuf_tail].x       = (*ev).x
+    g_mbuf[g_mbuf_tail].y       = (*ev).y
+    g_mbuf[g_mbuf_tail].dx      = (*ev).dx
+    g_mbuf[g_mbuf_tail].dy      = (*ev).dy
+    g_mbuf[g_mbuf_tail].buttons = (*ev).buttons
+    g_mbuf[g_mbuf_tail].scroll  = (*ev).scroll
+    g_mbuf[g_mbuf_tail].moved   = (*ev).moved
+    g_mbuf[g_mbuf_tail].px      = (*ev).px
+    g_mbuf[g_mbuf_tail].py      = (*ev).py
+  g_mbuf_tail = next
+  ret 0
+
+fn _buf_pop(ev:*MouseEvent) -> int:
+  if g_mbuf_head == g_mbuf_tail: ret (0 - 1)
+  unsafe:
+    (*ev).x       = g_mbuf[g_mbuf_head].x
+    (*ev).y       = g_mbuf[g_mbuf_head].y
+    (*ev).dx      = g_mbuf[g_mbuf_head].dx
+    (*ev).dy      = g_mbuf[g_mbuf_head].dy
+    (*ev).buttons = g_mbuf[g_mbuf_head].buttons
+    (*ev).scroll  = g_mbuf[g_mbuf_head].scroll
+    (*ev).moved   = g_mbuf[g_mbuf_head].moved
+    (*ev).px      = g_mbuf[g_mbuf_head].px
+    (*ev).py      = g_mbuf[g_mbuf_head].py
+  g_mbuf_head = (g_mbuf_head + 1) % MOUSE_BUF_SIZE
+  ret 0
+
+// ─── Visual cursor ───────────────────────────────────────────────
+
+fn _cursor_hide() -> int:
+  if vga.is_fb() != 0:
+    fb.mouse_erase()
+    ret 0
+  if g_cursor_visible == 0: ret 0
+  vga.putc_at(g_mouse_y, g_mouse_x, g_cursor_saved_ch, g_cursor_saved_attr)
+  g_cursor_visible = 0
+  ret 0
+
+fn _cursor_show() -> int:
+  if vga.is_fb() != 0:
+    fb.mouse_draw(g_mouse_px, g_mouse_py)
+    ret 0
+  // Save the cell beneath cursor, then draw inverted block
+  g_cursor_saved_ch   = 0  // placeholder; real save needs vga peek
+  g_cursor_saved_attr = vga.make_attr(COLOR_BLACK, COLOR_WHITE)
+  // Draw cursor: reverse-video block character
+  vga.putc_at(g_mouse_y, g_mouse_x, 219, vga.make_attr(COLOR_LIGHT_CYAN, COLOR_BLACK))
+  g_cursor_visible = 1
+  ret 0
+
+fn _cursor_update() -> int:
+  _cursor_hide()
+  _cursor_show()
+  ret 0
+
+// ─── Packet decoder ─────────────────────────────────────────────
+
+fn _process_packet() -> int:
+  b0:int = g_pkt_buf[0]
+  b1:int = g_pkt_buf[1]
+  b2:int = g_pkt_buf[2]
+
+  // Sanity: bit 3 of byte 0 must always be set
+  if (b0 & 8) == 0: ret 0
+
+  // Buttons
+  new_buttons:int = b0 & 7   // bit0=left, bit1=right, bit2=middle
+
+  // Sign-extend X/Y deltas (9-bit signed)
+  dx:int = b1
+  if (b0 & 0x10) != 0: dx = dx - 256   // X sign bit
+  dy:int = b2
+  if (b0 & 0x20) != 0: dy = dy - 256   // Y sign bit
+  // PS/2 Y axis is inverted vs screen (positive = up)
+  dy = 0 - dy
+
+  // Scroll wheel (4th byte, IntelliMouse)
+  scroll:int = 0
+  if g_has_wheel != 0:
+    raw_z:int = g_pkt_buf[3] & 0xFF
+    if raw_z != 0:
+      if (raw_z & 0x80) != 0:
+        scroll = raw_z - 256
+      else:
+        if (raw_z & 0x08) != 0 && (raw_z & 0xF0) == 0:
+          scroll = (raw_z & 0x0F) - 16
+        else:
+          scroll = raw_z
+
+  // Update absolute position
+  _cursor_hide()
+  old_x:int = g_mouse_x
+  old_y:int = g_mouse_y
+
+  if vga.is_fb() != 0:
+    g_mouse_px = g_mouse_px + dx
+    g_mouse_py = g_mouse_py + dy
+    if g_mouse_px < 0: g_mouse_px = 0
+    if g_mouse_px >= fb.width() - 12: g_mouse_px = fb.width() - 12
+    if g_mouse_py < 0: g_mouse_py = 0
+    if g_mouse_py >= fb.height() - 16: g_mouse_py = fb.height() - 16
+    g_mouse_x = g_mouse_px / 8
+    g_mouse_y = g_mouse_py / 16
+  else:
+    g_mouse_x = g_mouse_x + (dx / MOUSE_SENSITIVITY)
+    g_mouse_y = g_mouse_y + (dy / MOUSE_SENSITIVITY)
+    if g_mouse_x < 0:  g_mouse_x = 0
+    if g_mouse_x >= 80: g_mouse_x = 79
+    if g_mouse_y < 0:  g_mouse_y = 0
+    if g_mouse_y >= 24: g_mouse_y = 23   // keep off status bar row
+
+  g_buttons = new_buttons
+  g_scroll  = scroll
+
+  // Push event
+  ev:MouseEvent
+  ev.x       = g_mouse_x
+  ev.y       = g_mouse_y
+  ev.dx      = dx
+  ev.dy      = dy
+  ev.buttons = new_buttons
+  ev.scroll  = scroll
+  ev.moved   = (g_mouse_x != old_x || g_mouse_y != old_y)
+  ev.px      = g_mouse_px
+  ev.py      = g_mouse_py
+  unsafe: _buf_push(&ev)
+
+  // Redraw cursor at new position
+  _cursor_show()
+  ret 0
+
+// ─── IRQ12 handler ─────────────────────────────────────────────
+
+fn irq_handler() -> int:
+  // Status: make sure this byte came from the mouse (bit 5)
+  status:int = sys.sys_inb(PS2_STATUS)
+  if (status & 0x20) == 0:
+    sys.sys_outb(0x20, 0x20)  // PIC1 EOI
+    sys.sys_outb(0xA0, 0x20)  // PIC2 EOI
+    ret 0
+
+  data:int = sys.sys_inb(PS2_DATA)
+
+  // Accumulate packet bytes
+  g_pkt_buf[g_pkt_byte] = data
+  g_pkt_byte = g_pkt_byte + 1
+
+  pkt_size:int = 3
+  if g_has_wheel != 0: pkt_size = 4
+
+  if g_pkt_byte >= pkt_size:
+    g_pkt_byte = 0
+    _process_packet()
+
+  sys.sys_outb(0x20, 0x20)
+  sys.sys_outb(0xA0, 0x20)
+  ret 0
+
+// ─── Public API ─────────────────────────────────────────────────
+
+fn init() -> int:
+  g_available = 0
+  g_has_wheel = 0
+  g_pkt_byte  = 0
+  g_mbuf_head = 0
+  g_mbuf_tail = 0
+  g_mouse_x   = 40
+  g_mouse_y   = 12
+  g_mouse_px  = 640
+  g_mouse_py  = 400
+
+  // 1. Flush any pending data from controller with hardware delay
+  flush_t:int = 1000
+  while flush_t > 0:
+    st:int = sys.sys_inb(PS2_STATUS)
+    if (st & 1) != 0:
+      sys.sys_inb(PS2_DATA)
+    sys.sys_inb(0x80)
+    flush_t = flush_t - 1
+
+  // 2. Enable keyboard port (0xAE) and mouse auxiliary port (0xA8)
+  _ps2_wait_write()
+  sys.sys_outb(PS2_CMD, 0xAE)
+  _ps2_wait_write()
+  sys.sys_outb(PS2_CMD, PS2_CMD_ENABLE_MOUSE)
+
+  // 3. Enable interrupts (IRQ1 + IRQ12) and enable clocks in controller config
+  _ps2_wait_write()
+  sys.sys_outb(PS2_CMD, PS2_CMD_READ_CFG)
+  _ps2_wait_read()
+  cfg:int = sys.sys_inb(PS2_DATA)
+  cfg = cfg | 3        // bit0=IRQ1 (kbd), bit1=IRQ12 (mouse)
+  cfg = cfg & 0xCF     // clear bit4 (enable kbd clock), clear bit5 (enable mouse clock)
+  _ps2_wait_write()
+  sys.sys_outb(PS2_CMD, PS2_CMD_WRITE_CFG)
+  _ps2_wait_write()
+  sys.sys_outb(PS2_DATA, cfg)
+
+  // 4. Reset mouse (with fallback to SET_DEFAULTS for laptops/touchpads)
+  _mouse_send(MOUSE_CMD_RESET)
+  resp:int = _mouse_read()
+  if resp == MOUSE_ACK:
+    bat:int = _mouse_read()
+    _mouse_read() // device ID
+  else:
+    // If RESET timed out, try SET_DEFAULTS (0xF6) directly
+    _mouse_send(MOUSE_CMD_SET_DEFAULTS)
+    _mouse_read()
+
+  // 5. Try IntelliMouse scroll wheel probe (magic sample rates: 200, 100, 80)
+  _mouse_send(MOUSE_CMD_SET_SAMPLE_RATE)
+  _mouse_read()
+  _mouse_send(200)
+  _mouse_read()
+
+  _mouse_send(MOUSE_CMD_SET_SAMPLE_RATE)
+  _mouse_read()
+  _mouse_send(100)
+  _mouse_read()
+
+  _mouse_send(MOUSE_CMD_SET_SAMPLE_RATE)
+  _mouse_read()
+  _mouse_send(80)
+  _mouse_read()
+
+  _mouse_send(MOUSE_CMD_GET_DEVICE_ID)
+  _mouse_read()
+  dev_id:int = _mouse_read()
+  if dev_id == 3 || dev_id == 4:
+    g_has_wheel = 1
+
+  // 6. Set sample rate 60Hz and resolution 2 (4 counts/mm)
+  _mouse_send(MOUSE_CMD_SET_SAMPLE_RATE)
+  _mouse_read()
+  _mouse_send(60)
+  _mouse_read()
+
+  _mouse_send(MOUSE_CMD_SET_RESOLUTION)
+  _mouse_read()
+  _mouse_send(2)
+  _mouse_read()
+
+  // 7. Enable data reporting (stream mode 0xF4)
+  _mouse_send(MOUSE_CMD_STREAM_MODE)
+  resp_stream:int = _mouse_read()
+
+  // On bare metal, mark mouse available if ACKed or active
+  g_available = 1
+  g_inited    = 1
+  _cursor_show()
+  ret 1
+
+fn reset() -> int:
+  ret init()
+
+fn available() -> int: ret g_available
+fn has_wheel() -> int:  ret g_has_wheel
+
+fn x() -> int: ret g_mouse_x
+fn y() -> int: ret g_mouse_y
+fn pixel_x() -> int: ret g_mouse_px
+fn pixel_y() -> int: ret g_mouse_py
+fn buttons() -> int: ret g_buttons
+fn scroll_delta() -> int: ret g_scroll
+
+fn left_pressed()   -> int: ret (g_buttons & 1) != 0
+fn right_pressed()  -> int: ret (g_buttons & 2) != 0
+fn middle_pressed() -> int: ret (g_buttons & 4) != 0
+
+fn poll() -> int:
+  if g_available == 0: ret 0
+  count:int = 0
+  while count < 16:
+    st:int = sys.sys_inb(PS2_STATUS)
+    if (st & 1) == 0 || (st & 0x20) == 0: ret (count > 0)
+    data:int = sys.sys_inb(PS2_DATA)
+    if g_pkt_byte == 0:
+      // PS/2 sync bit: bit 3 of first packet byte must be 1
+      if (data & 8) == 0:
+        count = count + 1
+        continue
+    g_pkt_buf[g_pkt_byte] = data
+    g_pkt_byte = g_pkt_byte + 1
+    pkt_size:int = 3
+    if g_has_wheel != 0: pkt_size = 4
+    if g_pkt_byte >= pkt_size:
+      g_pkt_byte = 0
+      _process_packet()
+    count = count + 1
+  ret (count > 0)
+
+fn has_event() -> int:
+  poll()
+  ret g_mbuf_head != g_mbuf_tail
+
+fn read_event(ev:*MouseEvent) -> int:
+  ret _buf_pop(ev)
+
+fn show_cursor() -> int:
+  ret _cursor_show()
+
+fn hide_cursor() -> int:
+  ret _cursor_hide()

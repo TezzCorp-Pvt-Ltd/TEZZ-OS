@@ -1,0 +1,704 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — Virtual File System (VFS) & In-Memory Hierarchical FS (lib/vfs.tn)
+// ═══════════════════════════════════════════════════════════════
+
+import "heap"
+import "rtc"
+import "serial"
+
+extern fn sys_memcpy(dst:int, src:int, count:int) -> int
+extern fn sys_memset(dst:int, val:int, count:int) -> int
+
+let VFS_TYPE_FILE:int = 1
+let VFS_TYPE_DIR:int  = 2
+let VFS_TYPE_DEV:int  = 3
+
+let O_RDONLY:int = 0
+let O_WRONLY:int = 1
+let O_RDWR:int   = 2
+let O_CREAT:int  = 4
+let O_APPEND:int = 8
+let O_TRUNC:int  = 16
+
+let SEEK_SET:int = 0
+let SEEK_CUR:int = 1
+let SEEK_END:int = 2
+
+let MAX_NODES:int = 128
+let MAX_FDS:int   = 32
+
+struct VfsNode:
+  name_buf:[char;32]
+  name_len:int
+  node_type:int       // 1=file, 2=dir, 3=device
+  size:int            // current size in bytes
+  capacity:int        // allocated buffer capacity
+  parent:int          // node index of parent (-1 for root)
+  first_child:int     // first child index (-1 if none)
+  next_sibling:int    // next sibling in same directory (-1 if none)
+  data_ptr:int        // heap pointer to file content buffer
+  perm:int            // permissions (0755 dir, 0644 file)
+  in_use:int          // 1 if active, 0 if free
+  is_readonly:int     // 1 if protected kernel/system file
+  owner_uid:int       // 0 for root, 1000 for user
+
+struct VfsFile:
+  node_idx:int        // index into g_nodes
+  offset:int          // current read/write byte offset
+  flags:int           // open mode flags
+  in_use:int          // 1 if open
+
+static let g_nodes:[VfsNode;128]
+static let g_node_count:int = 0
+
+static let g_fds:[VfsFile;32]
+
+// Current working directory
+static let g_cwd_idx:int = 0
+static let g_cwd_path:[char;256]
+
+// Temporary buffer for path manipulation and string returns
+static let g_str_buf:[char;1024]
+static let g_part_buf:[char;64]
+
+// ─── String Helpers ──────────────────────────────────────────────
+
+fn _vfs_strlen(s:str) -> int:
+  p:*char = s as *char
+  n:int = 0
+  unsafe:
+    while p[n] != 0 as char:
+      n = n + 1
+  ret n
+
+fn _vfs_streq(a:str, b:str) -> int:
+  pa:*char = a as *char
+  pb:*char = b as *char
+  i:int = 0
+  unsafe:
+    while pa[i] != 0 as char && pb[i] != 0 as char:
+      if pa[i] != pb[i]: ret 0
+      i = i + 1
+    ret (pa[i] == pb[i])
+  ret 0
+
+fn _vfs_name_eq(node_idx:int, name:str) -> int:
+  if node_idx < 0 || node_idx >= MAX_NODES: ret 0
+  pn:*char = name as *char
+  i:int = 0
+  unsafe:
+    while pn[i] != 0 as char:
+      if i >= 31: ret 0
+      if g_nodes[node_idx].name_buf[i] != pn[i]: ret 0
+      i = i + 1
+    ret (g_nodes[node_idx].name_buf[i] == 0 as char)
+  ret 0
+
+// ─── Node Allocation ─────────────────────────────────────────────
+
+fn _alloc_node() -> int:
+  i:int = 0
+  while i < MAX_NODES:
+    unsafe:
+      if g_nodes[i].in_use == 0:
+        g_nodes[i].in_use = 1
+        g_nodes[i].first_child = (0 - 1)
+        g_nodes[i].next_sibling = (0 - 1)
+        g_nodes[i].data_ptr = 0
+        g_nodes[i].size = 0
+        g_nodes[i].capacity = 0
+        g_nodes[i].is_readonly = 0
+        g_nodes[i].owner_uid = 0
+        if i >= g_node_count:
+          g_node_count = i + 1
+        ret i
+    i = i + 1
+  ret (0 - 1)
+
+fn _set_node_name(node_idx:int, name:str) -> int:
+  if node_idx < 0 || node_idx >= MAX_NODES: ret 0
+  pn:*char = name as *char
+  i:int = 0
+  unsafe:
+    while pn[i] != 0 as char && i < 31:
+      g_nodes[node_idx].name_buf[i] = pn[i]
+      i = i + 1
+    g_nodes[node_idx].name_buf[i] = 0 as char
+    g_nodes[node_idx].name_len = i
+  ret i
+
+// ─── Path Resolution ─────────────────────────────────────────────
+
+fn vfs_find_child(parent_idx:int, name:str) -> int:
+  if parent_idx < 0 || parent_idx >= MAX_NODES: ret (0 - 1)
+  unsafe:
+    cur:int = g_nodes[parent_idx].first_child
+    while cur != (0 - 1):
+      if _vfs_name_eq(cur, name) != 0:
+        ret cur
+      cur = g_nodes[cur].next_sibling
+  ret (0 - 1)
+
+fn vfs_resolve_path(path:str) -> int:
+  if path == 0: ret (0 - 1)
+  p:*char = path as *char
+  if p[0] == 0 as char: ret (0 - 1)
+
+  cur_node:int = g_cwd_idx
+  pos:int = 0
+
+  // If path starts with '/', start from root node 0
+  unsafe:
+    if p[0] == 47 as char:  // '/'
+      cur_node = 0
+      pos = 1
+      while p[pos] == 47 as char:
+        pos = pos + 1
+      if p[pos] == 0 as char:
+        ret 0
+
+  while 1:
+    unsafe:
+      if p[pos] == 0 as char:
+        ret cur_node
+
+      // Extract next component
+      part_len:int = 0
+      while p[pos] != 0 as char && p[pos] != 47 as char && part_len < 63:
+        g_part_buf[part_len] = p[pos]
+        part_len = part_len + 1
+        pos = pos + 1
+      g_part_buf[part_len] = 0 as char
+
+      // Skip slashes
+      while p[pos] == 47 as char:
+        pos = pos + 1
+
+      if part_len == 0:
+        continue
+
+      part_str:str = (&g_part_buf[0]) as str
+
+      // Handle "." (current)
+      if _vfs_streq(part_str, ".") != 0:
+        continue
+
+      // Handle ".." (parent)
+      if _vfs_streq(part_str, "..") != 0:
+        parent_idx:int = g_nodes[cur_node].parent
+        if parent_idx >= 0:
+          cur_node = parent_idx
+        continue
+
+      // Look up child by name
+      child:int = vfs_find_child(cur_node, part_str)
+      if child == (0 - 1):
+        ret (0 - 1)
+      cur_node = child
+  ret cur_node
+
+// ─── Directory and File Creation ─────────────────────────────────
+
+fn vfs_mkdir(path:str) -> int:
+  if path == 0: ret (0 - 1)
+  p:*char = path as *char
+  len:int = _vfs_strlen(path)
+  if len == 0: ret (0 - 1)
+
+  // Split into parent path and directory name
+  last_slash:int = (0 - 1)
+  i:int = len - 1
+  // Ignore trailing slash
+  if i > 0 && p[i] == 47 as char:
+    i = i - 1
+  end_pos:int = i + 1
+
+  while i >= 0:
+    if p[i] == 47 as char:
+      last_slash = i
+      break
+    i = i - 1
+
+  parent_node:int = g_cwd_idx
+  name_start:int = 0
+
+  if last_slash == 0:
+    parent_node = 0
+    name_start = 1
+  else:
+    if last_slash > 0:
+      // Copy parent path into buffer
+      unsafe:
+        j:int = 0
+        while j < last_slash:
+          g_str_buf[j] = p[j]
+          j = j + 1
+        g_str_buf[j] = 0 as char
+      parent_node = vfs_resolve_path((&g_str_buf[0]) as str)
+      if parent_node == (0 - 1): ret (0 - 1)
+      name_start = last_slash + 1
+
+  // Extract dir name
+  unsafe:
+    k:int = 0
+    while (name_start + k) < end_pos && k < 31:
+      g_part_buf[k] = p[name_start + k]
+      k = k + 1
+    g_part_buf[k] = 0 as char
+
+  dir_name:str = (&g_part_buf[0]) as str
+  if _vfs_strlen(dir_name) == 0: ret (0 - 1)
+
+  // Check if already exists
+  if vfs_find_child(parent_node, dir_name) != (0 - 1):
+    ret (0 - 1)
+
+  // Allocate new node
+  new_idx:int = _alloc_node()
+  if new_idx == (0 - 1): ret (0 - 1)
+
+  unsafe:
+    _set_node_name(new_idx, dir_name)
+    g_nodes[new_idx].node_type   = VFS_TYPE_DIR
+    g_nodes[new_idx].size        = 0
+    g_nodes[new_idx].capacity    = 0
+    g_nodes[new_idx].data_ptr    = 0
+    g_nodes[new_idx].parent      = parent_node
+    g_nodes[new_idx].perm        = 493  // 0755
+    g_nodes[new_idx].first_child = (0 - 1)
+
+    // Insert at end of parent's children
+    if g_nodes[parent_node].first_child == (0 - 1):
+      g_nodes[parent_node].first_child = new_idx
+    else:
+      curr:int = g_nodes[parent_node].first_child
+      while g_nodes[curr].next_sibling != (0 - 1):
+        curr = g_nodes[curr].next_sibling
+      g_nodes[curr].next_sibling = new_idx
+  ret new_idx
+
+fn vfs_touch(path:str) -> int:
+  if path == 0: ret (0 - 1)
+  p:*char = path as *char
+  len:int = _vfs_strlen(path)
+  if len == 0: ret (0 - 1)
+
+  last_slash:int = (0 - 1)
+  i:int = len - 1
+  while i >= 0:
+    if p[i] == 47 as char:
+      last_slash = i
+      break
+    i = i - 1
+
+  parent_node:int = g_cwd_idx
+  name_start:int = 0
+
+  if last_slash == 0:
+    parent_node = 0
+    name_start = 1
+  else:
+    if last_slash > 0:
+      unsafe:
+        j:int = 0
+        while j < last_slash:
+          g_str_buf[j] = p[j]
+          j = j + 1
+        g_str_buf[j] = 0 as char
+      parent_node = vfs_resolve_path((&g_str_buf[0]) as str)
+      if parent_node == (0 - 1): ret (0 - 1)
+      name_start = last_slash + 1
+
+  unsafe:
+    k:int = 0
+    while (name_start + k) < len && k < 31:
+      g_part_buf[k] = p[name_start + k]
+      k = k + 1
+    g_part_buf[k] = 0 as char
+
+  file_name:str = (&g_part_buf[0]) as str
+  if _vfs_strlen(file_name) == 0: ret (0 - 1)
+
+  // If already exists, return existing node
+  exist:int = vfs_find_child(parent_node, file_name)
+  if exist != (0 - 1): ret exist
+
+  new_idx:int = _alloc_node()
+  if new_idx == (0 - 1): ret (0 - 1)
+
+  // Allocate initial 256 byte buffer on heap
+  init_buf:int = heap.alloc(256)
+
+  unsafe:
+    _set_node_name(new_idx, file_name)
+    g_nodes[new_idx].node_type   = VFS_TYPE_FILE
+    g_nodes[new_idx].size        = 0
+    g_nodes[new_idx].capacity    = 256
+    g_nodes[new_idx].data_ptr    = init_buf
+    g_nodes[new_idx].parent      = parent_node
+    g_nodes[new_idx].perm        = 420  // 0644
+    g_nodes[new_idx].first_child = (0 - 1)
+
+    if g_nodes[parent_node].first_child == (0 - 1):
+      g_nodes[parent_node].first_child = new_idx
+    else:
+      curr:int = g_nodes[parent_node].first_child
+      while g_nodes[curr].next_sibling != (0 - 1):
+        curr = g_nodes[curr].next_sibling
+      g_nodes[curr].next_sibling = new_idx
+  ret new_idx
+
+// ─── File Write & Read ───────────────────────────────────────────
+
+fn vfs_write_file(path:str, content:str) -> int:
+  node:int = vfs_touch(path)
+  if node == (0 - 1): ret (0 - 1)
+
+  c_len:int = _vfs_strlen(content)
+  pc:*char = content as *char
+
+  unsafe:
+    if g_nodes[node].is_readonly != 0: ret (0 - 3)
+
+    // If content exceeds buffer capacity, expand buffer
+    if c_len + 1 > g_nodes[node].capacity:
+      new_cap:int = ((c_len + 512) / 256) * 256
+      new_buf:int = heap.alloc(new_cap)
+      if new_buf == 0: ret (0 - 1)
+      if g_nodes[node].data_ptr != 0:
+        heap.kfree(g_nodes[node].data_ptr)
+      g_nodes[node].data_ptr = new_buf
+      g_nodes[node].capacity = new_cap
+
+    dst:*char = g_nodes[node].data_ptr as *char
+    i:int = 0
+    while i < c_len:
+      dst[i] = pc[i]
+      i = i + 1
+    dst[c_len] = 0 as char
+    g_nodes[node].size = c_len
+  ret c_len
+
+fn vfs_append_file(path:str, content:str) -> int:
+  node:int = vfs_touch(path)
+  if node == (0 - 1): ret (0 - 1)
+
+  c_len:int = _vfs_strlen(content)
+  pc:*char = content as *char
+  total_len:int = 0
+
+  unsafe:
+    if g_nodes[node].is_readonly != 0: ret (0 - 3)
+
+    old_size:int = g_nodes[node].size
+    total_len = old_size + c_len
+    if total_len + 1 > g_nodes[node].capacity:
+      new_cap:int = ((total_len + 512) / 256) * 256
+      new_buf:int = heap.alloc(new_cap)
+      if new_buf == 0: ret (0 - 1)
+      if old_size > 0 && g_nodes[node].data_ptr != 0:
+        sys_memcpy(new_buf, g_nodes[node].data_ptr, old_size)
+      if g_nodes[node].data_ptr != 0:
+        heap.kfree(g_nodes[node].data_ptr)
+      g_nodes[node].data_ptr = new_buf
+      g_nodes[node].capacity = new_cap
+
+    dst:*char = g_nodes[node].data_ptr as *char
+    i:int = 0
+    while i < c_len:
+      dst[old_size + i] = pc[i]
+      i = i + 1
+    dst[total_len] = 0 as char
+    g_nodes[node].size = total_len
+  ret total_len
+
+fn vfs_read_file(path:str) -> str:
+  node:int = vfs_resolve_path(path)
+  if node == (0 - 1): ret ""
+  unsafe:
+    if g_nodes[node].node_type != VFS_TYPE_FILE: ret ""
+    if g_nodes[node].size == 0 || g_nodes[node].data_ptr == 0: ret ""
+    ret (g_nodes[node].data_ptr as *char) as str
+  ret ""
+
+fn vfs_remove(path:str) -> int:
+  node:int = vfs_resolve_path(path)
+  if node <= 0 || node >= MAX_NODES: ret (0 - 1) // cannot remove root
+
+  unsafe:
+    if g_nodes[node].is_readonly != 0: ret (0 - 3) // read-only kernel file protected!
+
+    parent:int = g_nodes[node].parent
+    if parent < 0: ret (0 - 1)
+
+    // If directory, ensure it has no children
+    if g_nodes[node].node_type == VFS_TYPE_DIR:
+      if g_nodes[node].first_child != (0 - 1):
+        ret (0 - 2) // not empty
+
+    // Unlink from sibling chain
+    if g_nodes[parent].first_child == node:
+      g_nodes[parent].first_child = g_nodes[node].next_sibling
+    else:
+      curr:int = g_nodes[parent].first_child
+      while curr != (0 - 1):
+        if g_nodes[curr].next_sibling == node:
+          g_nodes[curr].next_sibling = g_nodes[node].next_sibling
+          break
+        curr = g_nodes[curr].next_sibling
+
+    // Free data buffer if any
+    if g_nodes[node].data_ptr != 0:
+      heap.kfree(g_nodes[node].data_ptr)
+      g_nodes[node].data_ptr = 0
+
+    g_nodes[node].in_use = 0
+    g_nodes[node].size = 0
+    g_nodes[node].capacity = 0
+    g_nodes[node].name_len = 0
+    g_nodes[node].first_child = (0 - 1)
+    g_nodes[node].next_sibling = (0 - 1)
+  ret 0
+
+fn vfs_set_readonly(path:str, ro:int) -> int:
+  node:int = vfs_resolve_path(path)
+  if node < 0 || node >= MAX_NODES: ret (0 - 1)
+  unsafe: g_nodes[node].is_readonly = ro
+  ret 0
+
+fn vfs_is_readonly(node_idx:int) -> int:
+  if node_idx < 0 || node_idx >= MAX_NODES: ret 0
+  unsafe: ret g_nodes[node_idx].is_readonly
+  ret 0
+
+fn vfs_set_owner(path:str, uid:int) -> int:
+  node:int = vfs_resolve_path(path)
+  if node < 0 || node >= MAX_NODES: ret (0 - 1)
+  unsafe: g_nodes[node].owner_uid = uid
+  ret 0
+
+fn vfs_get_owner(node_idx:int) -> int:
+  if node_idx < 0 || node_idx >= MAX_NODES: ret 0
+  unsafe: ret g_nodes[node_idx].owner_uid
+  ret 0
+
+fn vfs_copy(src_path:str, dst_path:str) -> int:
+  src_node:int = vfs_resolve_path(src_path)
+  if src_node < 0 || src_node >= MAX_NODES: ret (0 - 1)
+  unsafe:
+    if g_nodes[src_node].node_type != VFS_TYPE_FILE: ret (0 - 2)
+    content:str = ""
+    if g_nodes[src_node].size > 0 && g_nodes[src_node].data_ptr != 0:
+      content = (g_nodes[src_node].data_ptr as *char) as str
+    ret vfs_write_file(dst_path, content)
+  ret (0 - 1)
+
+fn vfs_move(src_path:str, dst_path:str) -> int:
+  cp_res:int = vfs_copy(src_path, dst_path)
+  if cp_res < 0: ret cp_res
+  ret vfs_remove(src_path)
+
+// ─── Current Working Directory ───────────────────────────────────
+
+fn vfs_chdir(path:str) -> int:
+  node:int = vfs_resolve_path(path)
+  if node == (0 - 1): ret (0 - 1)
+  unsafe:
+    if g_nodes[node].node_type != VFS_TYPE_DIR: ret (0 - 2)
+  g_cwd_idx = node
+  ret 0
+
+fn vfs_get_cwd_idx() -> int:
+  ret g_cwd_idx
+
+fn vfs_get_cwd_path() -> str:
+  if g_cwd_idx == 0:
+    ret "/"
+
+  // Walk up to root and build path
+  chain:[int;32]
+  depth:int = 0
+  cur:int = g_cwd_idx
+  while cur > 0 && depth < 31:
+    unsafe:
+      chain[depth] = cur
+      depth = depth + 1
+      cur = g_nodes[cur].parent
+
+  unsafe:
+    pos:int = 0
+    d:int = depth - 1
+    while d >= 0:
+      g_cwd_path[pos] = 47 as char // '/'
+      pos = pos + 1
+      n_idx:int = chain[d]
+      p:*char = &g_nodes[n_idx].name_buf[0]
+      i:int = 0
+      while p[i] != 0 as char && pos < 250:
+        g_cwd_path[pos] = p[i]
+        pos = pos + 1
+        i = i + 1
+      d = d - 1
+    g_cwd_path[pos] = 0 as char
+    ret (&g_cwd_path[0]) as str
+  ret "/"
+
+// ─── Node Inspection Getters ─────────────────────────────────────
+
+fn node_count() -> int: ret g_node_count
+fn node_in_use(idx:int) -> int:
+  if idx < 0 || idx >= MAX_NODES: ret 0
+  unsafe: ret g_nodes[idx].in_use
+
+fn node_name(idx:int) -> str:
+  if idx < 0 || idx >= MAX_NODES: ret ""
+  unsafe:
+    if g_nodes[idx].in_use == 0: ret ""
+    ret (&g_nodes[idx].name_buf[0]) as str
+  ret ""
+
+fn node_type(idx:int) -> int:
+  if idx < 0 || idx >= MAX_NODES: ret 0
+  unsafe: ret g_nodes[idx].node_type
+
+fn node_size(idx:int) -> int:
+  if idx < 0 || idx >= MAX_NODES: ret 0
+  unsafe: ret g_nodes[idx].size
+
+fn node_parent(idx:int) -> int:
+  if idx < 0 || idx >= MAX_NODES: ret (0 - 1)
+  unsafe: ret g_nodes[idx].parent
+
+fn node_first_child(idx:int) -> int:
+  if idx < 0 || idx >= MAX_NODES: ret (0 - 1)
+  unsafe: ret g_nodes[idx].first_child
+
+fn node_next_sibling(idx:int) -> int:
+  if idx < 0 || idx >= MAX_NODES: ret (0 - 1)
+  unsafe: ret g_nodes[idx].next_sibling
+
+fn node_perm(idx:int) -> int:
+  if idx < 0 || idx >= MAX_NODES: ret 0
+  unsafe: ret g_nodes[idx].perm
+
+// ─── Filesystem Initialization & System Files ────────────────────
+
+fn init() -> int:
+  serial.log("VFS", "Initializing Virtual File System...")
+
+  // Zero nodes and file descriptors
+  i:int = 0
+  while i < MAX_NODES:
+    unsafe:
+      g_nodes[i].in_use       = 0
+      g_nodes[i].data_ptr     = 0
+      g_nodes[i].first_child  = (0 - 1)
+      g_nodes[i].next_sibling = (0 - 1)
+      g_nodes[i].parent       = (0 - 1)
+    i = i + 1
+
+  j:int = 0
+  while j < MAX_FDS:
+    unsafe:
+      g_fds[j].in_use   = 0
+      g_fds[j].node_idx = (0 - 1)
+      g_fds[j].offset   = 0
+    j = j + 1
+
+  // Create root node "/"
+  g_nodes[0].in_use       = 1
+  g_nodes[0].node_type   = VFS_TYPE_DIR
+  g_nodes[0].parent      = (0 - 1)
+  g_nodes[0].first_child = (0 - 1)
+  g_nodes[0].next_sibling= (0 - 1)
+  g_nodes[0].perm        = 493 // 0755
+  _set_node_name(0, "/")
+  g_node_count = 1
+  g_cwd_idx = 0
+
+  // 1. Create standard Unix directory hierarchy
+  vfs_mkdir("/bin")
+  vfs_mkdir("/etc")
+  vfs_mkdir("/dev")
+  vfs_mkdir("/home")
+  vfs_mkdir("/boot")
+  vfs_mkdir("/doc")
+
+  // 2. Populate /etc configuration files
+  vfs_write_file("/etc/os-release", "NAME=\"TEZZ-OS\"\nVERSION=\"0.1.0\"\nID=\"tezzos\"\nCODENAME=\"Nova\"\nPRETTY_NAME=\"TEZZ-OS 0.1.0 Nova (x86_64)\"\nBUILD_ENGINE=\"TezzNative 1.1.0\"\nBOOTLOADER=\"Limine 12.9.3\"\nARCH=\"x86_64\"\n")
+
+  vfs_write_file("/etc/motd", "=================================================================\n  TEZZ-OS Nova (x86_64 Higher-Half Long Mode Kernel)\n=================================================================\nWelcome! Pure TezzNative operating system booted successfully.\nType 'help' for command manual, 'ls' to browse filesystem.\n")
+
+  vfs_write_file("/etc/hostname", "tezzbox\n")
+  vfs_write_file("/etc/version", "0.1.0\n")
+
+  vfs_write_file("/etc/fstab", "# <file system> <mount point>   <type>  <options>       <dump>  <pass>\nrootfs          /               vfs     rw,relatime     0       1\ndevfs           /dev            devfs   rw,nosuid       0       0\n")
+
+  // 3. Populate /boot information and kernel binary (Read-Only Protected)
+  vfs_touch("/boot/tezzos.elf")
+  vfs_write_file("/boot/tezzos.elf", "ELF64_TEZZOS_KERNEL_CORE_IMAGE_PROTECTED")
+  vfs_write_file("/boot/limine.conf", "timeout: 3\n\n/TEZZ-OS (Pure TezzNative Kernel)\n    protocol: limine\n    path: boot():/boot/tezzos.elf\n    cmdline: console=vga0 debug=serial\n")
+  vfs_write_file("/boot/kernel.info", "Architecture : x86_64 Higher-Half Long Mode\nVirtual Base : 0xFFFFFFFF80000000\nBoot Protocol: Limine 12.9.3 Protocol Revision 3\nCompiler     : TezzNative 1.1.0 (tezzc --freestanding)\nResolution   : 1280x800x32bpp Linear Framebuffer\nHeap Memory  : 4096 KB dynamic kernel heap\nCorporate    : TEZZCORP PRIVATE LIMITED (https://tezzcorp.com)\n")
+
+  // Protect kernel files from rm/write/modification
+  vfs_set_readonly("/boot", 1)
+  vfs_set_readonly("/boot/tezzos.elf", 1)
+  vfs_set_readonly("/boot/limine.conf", 1)
+  vfs_set_readonly("/boot/kernel.info", 1)
+  vfs_set_readonly("/etc/os-release", 1)
+
+  // 4. Populate /doc documentation files
+  vfs_write_file("/doc/readme.txt", "TEZZ-OS NOVA OVERVIEW\n\nTEZZ-OS is a modern, high-performance operating system written from scratch\nin Pure TezzNative language by TEZZCORP PRIVATE LIMITED (https://tezzcorp.com).\nIt boots via Limine directly into 64-bit Long Mode with higher-half virtual mapping.\n\nCorporate Contact: info@tezzcorp.com\n")
+
+  vfs_write_file("/doc/commands.txt", "TEZZ-OS COMMAND MANUAL\n\nUser Space & Filesystem:\n  ls [path]         List directory contents with permissions and sizes\n  cd <path>         Change current working directory\n  pwd               Print current working directory path\n  cat <file>        Display content of a text file\n  edit <file>       Create or view text files\n  cp <src> <dst>    Copy file to destination\n  mv <src> <dst>    Move or rename file\n  find <name>       Search for files in directory tree\n  touch <file>      Create an empty file\n  mkdir <dir>       Create a new directory\n  write <f> <t>     Write text into a file\n  append <f><t>     Append text into a file\n  rm <file>         Remove file or empty directory (kernel files protected)\n  stat <path>       Display inode metadata\n  df                Display storage usage\n\nPackage Manager (TEZZ-PKG):\n  tezz list         List available and installed software packages\n  tezz install <p>  Install software package into /bin\n  tezz update       Refresh repository catalog from tezzcorp.com\n  tezz upgrade      Upgrade installed packages to latest version\n  tezz remove <p>   Remove an installed package\n  tezz info <p>     Display detailed package metadata\n\nPermissions & System:\n  super [pwd]       Activate superuser (root) privileges\n  whoami            Display active user identity\n  id                Display UID and GID\n  mouse [reset]     Display or re-probe PS/2 mouse hardware\n  calc <expr>       Evaluate math expression\n  help              Display help overview\n  neofetch          Display TEZZ banner and hardware specs\n  uptime            Display elapsed system uptime\n  date              Display hardware RTC clock\n  clear             Clear terminal screen\n  reboot            Reboot computer\n  shutdown          Power off computer\n")
+
+  // 5. Build User Space (/home/user and /home/root)
+  vfs_mkdir("/home/user")
+  vfs_set_owner("/home/user", 1000)
+
+  vfs_mkdir("/home/user/documents")
+  vfs_set_owner("/home/user/documents", 1000)
+  vfs_write_file("/home/user/documents/welcome.txt", "Welcome to TEZZ-OS User Space!\n\nThis is your private user storage directory. You can create,\nedit, and store personal files here safely.\n\nCommands you can use:\n  edit <file>       Create or edit text files\n  cat <file>        Display file contents\n  cp <src> <dst>    Copy file\n  mv <src> <dst>    Rename / move file\n  tezz install <p>  Install software packages\n  tezz list         List available packages\n  super             Activate superuser (root) privileges\n\nCorporate Information:\nTEZZCORP PRIVATE LIMITED (https://tezzcorp.com/) info@tezzcorp.com\n")
+  vfs_set_owner("/home/user/documents/welcome.txt", 1000)
+
+  vfs_mkdir("/home/user/downloads")
+  vfs_set_owner("/home/user/downloads", 1000)
+
+  vfs_mkdir("/home/user/code")
+  vfs_set_owner("/home/user/code", 1000)
+  vfs_write_file("/home/user/code/hello.tn", "// TEZZ-OS User Application in Pure TezzNative\nfn main() -> int:\n  vga.print(\"Hello from TEZZ-OS User Space!\\n\")\n  vga.print(\"Powered by TEZZCORP (https://tezzcorp.com)\\n\")\n  ret 0\n")
+  vfs_set_owner("/home/user/code/hello.tn", 1000)
+
+  vfs_mkdir("/home/root")
+  vfs_set_owner("/home/root", 0)
+  vfs_write_file("/home/root/readme.txt", "TEZZ-OS Superuser Workspace\nAccessible only by root (UID 0).\n")
+  vfs_set_owner("/home/root/readme.txt", 0)
+
+  // 6. Populate /dev device nodes
+  vfs_touch("/dev/null")
+  vfs_touch("/dev/zero")
+  vfs_touch("/dev/fb0")
+  vfs_touch("/dev/com1")
+  vfs_touch("/dev/mouse")
+  vfs_touch("/dev/rtc")
+
+  node_null:int = vfs_resolve_path("/dev/null")
+  if node_null >= 0: g_nodes[node_null].node_type = VFS_TYPE_DEV
+
+  node_zero:int = vfs_resolve_path("/dev/zero")
+  if node_zero >= 0: g_nodes[node_zero].node_type = VFS_TYPE_DEV
+
+  node_fb:int = vfs_resolve_path("/dev/fb0")
+  if node_fb >= 0: g_nodes[node_fb].node_type = VFS_TYPE_DEV
+
+  node_com1:int = vfs_resolve_path("/dev/com1")
+  if node_com1 >= 0: g_nodes[node_com1].node_type = VFS_TYPE_DEV
+
+  node_mouse:int = vfs_resolve_path("/dev/mouse")
+  if node_mouse >= 0: g_nodes[node_mouse].node_type = VFS_TYPE_DEV
+
+  node_rtc:int = vfs_resolve_path("/dev/rtc")
+  if node_rtc >= 0: g_nodes[node_rtc].node_type = VFS_TYPE_DEV
+
+  serial.log("VFS", "Virtual File System ready. Root hierarchy mounted.")
+  ret 0

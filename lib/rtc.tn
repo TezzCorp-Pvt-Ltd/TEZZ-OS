@@ -1,0 +1,49 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — CMOS Real-Time Clock Driver (lib/rtc.tn)
+// ═══════════════════════════════════════════════════════════════
+
+import "sys"
+
+let CMOS_ADDR:int = 0x70
+let CMOS_DATA:int = 0x71
+
+fn _read_reg(reg:int) -> int:
+  sys.sys_outb(CMOS_ADDR, reg)
+  ret sys.sys_inb(CMOS_DATA)
+
+fn _bcd_to_bin(bcd:int) -> int:
+  ret ((bcd / 16) * 10) + (bcd & 0x0F)
+
+fn is_updating() -> int:
+  ret (_read_reg(0x0A) & 0x80) != 0
+
+fn get_second() -> int:
+  t:int = 10000
+  while is_updating() != 0 && t > 0: t = t - 1
+  ret _bcd_to_bin(_read_reg(0x00))
+
+fn get_minute() -> int:
+  t:int = 10000
+  while is_updating() != 0 && t > 0: t = t - 1
+  ret _bcd_to_bin(_read_reg(0x02))
+
+fn get_hour() -> int:
+  t:int = 10000
+  while is_updating() != 0 && t > 0: t = t - 1
+  ret _bcd_to_bin(_read_reg(0x04))
+
+fn get_day() -> int:
+  t:int = 10000
+  while is_updating() != 0 && t > 0: t = t - 1
+  ret _bcd_to_bin(_read_reg(0x07))
+
+fn get_month() -> int:
+  t:int = 10000
+  while is_updating() != 0 && t > 0: t = t - 1
+  ret _bcd_to_bin(_read_reg(0x08))
+
+fn get_year() -> int:
+  t:int = 10000
+  while is_updating() != 0 && t > 0: t = t - 1
+  y:int = _bcd_to_bin(_read_reg(0x09))
+  ret 2000 + y

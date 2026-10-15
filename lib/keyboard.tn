@@ -1,0 +1,464 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — PS/2 Keyboard Driver (drivers/keyboard.tn)
+// ═══════════════════════════════════════════════════════════════
+//
+//  Full PS/2 keyboard driver with:
+//   - Scancode Set 1 (PC XT) → ASCII mapping
+//   - All modifier keys: Shift, Ctrl, Alt, AltGr, CapsLock,
+//     NumLock, ScrollLock
+//   - All special keys: F1–F12, arrows, Del, Ins, Home, End,
+//     PgUp, PgDn, PrintScreen, Pause/Break
+//   - Key repeat (typematic rate via PIT tick)
+//   - 256-event circular key ring buffer
+//   - IRQ1 handler
+//
+//  Usage:
+//    keyboard.init()              // called once at boot
+//    ch:int = keyboard.getc()    // blocking read (raw ASCII / key code)
+//    ev:KeyEvent = keyboard.read_event()  // non-blocking, full event
+// ═══════════════════════════════════════════════════════════════
+
+import "sys"
+import "vga"
+import "serial"
+
+// ─── I/O ports ──────────────────────────────────────────────────
+
+let KBD_DATA_PORT:int    = 0x60   // keyboard data
+let KBD_STATUS_PORT:int  = 0x64   // controller status (read)
+let KBD_CMD_PORT:int     = 0x64   // controller command (write)
+
+// Controller commands
+let KBD_CMD_SET_LEDS:int          = 0xED
+let KBD_CMD_ECHO:int              = 0xEE
+let KBD_CMD_SET_SCANCODE_SET:int  = 0xF0
+let KBD_CMD_IDENTIFY:int          = 0xF2
+let KBD_CMD_SET_TYPEMATIC:int     = 0xF3
+let KBD_CMD_ENABLE_SCANNING:int   = 0xF4
+let KBD_CMD_DISABLE_SCANNING:int  = 0xF5
+let KBD_CMD_RESET:int             = 0xFF
+
+let KBD_ACK:int  = 0xFA
+let KBD_RESEND:int = 0xFE
+
+// ─── Key codes (extended virtual keys, above ASCII) ─────────────
+
+let KEY_NONE:int       = 0
+let KEY_F1:int         = 0x100
+let KEY_F2:int         = 0x101
+let KEY_F3:int         = 0x102
+let KEY_F4:int         = 0x103
+let KEY_F5:int         = 0x104
+let KEY_F6:int         = 0x105
+let KEY_F7:int         = 0x106
+let KEY_F8:int         = 0x107
+let KEY_F9:int         = 0x108
+let KEY_F10:int        = 0x109
+let KEY_F11:int        = 0x10A
+let KEY_F12:int        = 0x10B
+let KEY_UP:int         = 0x110
+let KEY_DOWN:int       = 0x111
+let KEY_LEFT:int       = 0x112
+let KEY_RIGHT:int      = 0x113
+let KEY_HOME:int       = 0x114
+let KEY_END:int        = 0x115
+let KEY_PGUP:int       = 0x116
+let KEY_PGDN:int       = 0x117
+let KEY_INS:int        = 0x118
+let KEY_DEL:int        = 0x119
+let KEY_PRTSC:int      = 0x11A
+let KEY_PAUSE:int      = 0x11B
+let KEY_LSHIFT:int     = 0x120
+let KEY_RSHIFT:int     = 0x121
+let KEY_LCTRL:int      = 0x122
+let KEY_RCTRL:int      = 0x123
+let KEY_LALT:int       = 0x124
+let KEY_RALT:int       = 0x125
+let KEY_LGUI:int       = 0x126
+let KEY_RGUI:int       = 0x127
+let KEY_CAPSLOCK:int   = 0x128
+let KEY_NUMLOCK:int    = 0x129
+let KEY_SCROLLLOCK:int = 0x12A
+let KEY_TAB:int        = 0x09
+let KEY_ESC:int        = 0x1B
+let KEY_ENTER:int      = 0x0D
+let KEY_BACKSPACE:int  = 0x08
+
+// Modifier flags
+let MOD_SHIFT:int      = 1
+let MOD_CTRL:int       = 2
+let MOD_ALT:int        = 4
+let MOD_ALTGR:int      = 8
+let MOD_CAPSLOCK:int   = 16
+let MOD_NUMLOCK:int    = 32
+let MOD_SCROLLLOCK:int = 64
+
+// ─── Key event structure ─────────────────────────────────────────
+
+struct KeyEvent:
+  keycode:int    // ASCII (0–127) or KEY_* constant (>= 0x100)
+  modifiers:int  // bitmask of MOD_* flags
+  pressed:int    // 1 = pressed, 0 = released
+  raw_scan:int   // raw scancode byte(s)
+
+// ─── Circular event ring buffer ──────────────────────────────────
+
+let KBD_BUF_SIZE:int = 256
+static let g_kbuf:[KeyEvent;256]
+static let g_kbuf_head:int = 0
+static let g_kbuf_tail:int = 0
+
+// ─── Driver state ───────────────────────────────────────────────
+
+static let g_modifiers:int = 0
+static let g_extended:int  = 0   // expecting E0 extended scancode
+static let g_leds:int      = 0   // LED state bitfield
+static let g_inited:int    = 0
+
+// ─── Scancode Set 1 → ASCII ─────────────────────────────────────
+
+fn _sc_to_ascii(sc:int, shift:int) -> int:
+  if shift != 0:
+    if sc == 0x02: ret 33  // !
+    if sc == 0x03: ret 64  // @
+    if sc == 0x04: ret 35  // #
+    if sc == 0x05: ret 36  // $
+    if sc == 0x06: ret 37  // %
+    if sc == 0x07: ret 94  // ^
+    if sc == 0x08: ret 38  // &
+    if sc == 0x09: ret 42  // *
+    if sc == 0x0A: ret 40  // (
+    if sc == 0x0B: ret 41  // )
+    if sc == 0x0C: ret 95  // _
+    if sc == 0x0D: ret 43  // +
+    if sc == 0x1A: ret 123 // {
+    if sc == 0x1B: ret 125 // }
+    if sc == 0x27: ret 58  // :
+    if sc == 0x28: ret 34  // "
+    if sc == 0x29: ret 126 // ~
+    if sc == 0x2B: ret 124 // |
+    if sc == 0x33: ret 60  // <
+    if sc == 0x34: ret 62  // >
+    if sc == 0x35: ret 63  // ?
+    if sc == 0x10: ret 81  // Q
+    if sc == 0x11: ret 87  // W
+    if sc == 0x12: ret 69  // E
+    if sc == 0x13: ret 82  // R
+    if sc == 0x14: ret 84  // T
+    if sc == 0x15: ret 89  // Y
+    if sc == 0x16: ret 85  // U
+    if sc == 0x17: ret 73  // I
+    if sc == 0x18: ret 79  // O
+    if sc == 0x19: ret 80  // P
+    if sc == 0x1E: ret 65  // A
+    if sc == 0x1F: ret 83  // S
+    if sc == 0x20: ret 68  // D
+    if sc == 0x21: ret 70  // F
+    if sc == 0x22: ret 71  // G
+    if sc == 0x23: ret 72  // H
+    if sc == 0x24: ret 74  // J
+    if sc == 0x25: ret 75  // K
+    if sc == 0x26: ret 76  // L
+    if sc == 0x2C: ret 90  // Z
+    if sc == 0x2D: ret 88  // X
+    if sc == 0x2E: ret 67  // C
+    if sc == 0x2F: ret 86  // V
+    if sc == 0x30: ret 66  // B
+    if sc == 0x31: ret 78  // N
+    if sc == 0x32: ret 77  // M
+  else:
+    if sc >= 0x02 && sc <= 0x0A: ret sc + 47  // '1'..'9'
+    if sc == 0x0B: ret 48 // '0'
+    if sc == 0x0C: ret 45 // '-'
+    if sc == 0x0D: ret 61 // '='
+    if sc == 0x1A: ret 91 // '['
+    if sc == 0x1B: ret 93 // ']'
+    if sc == 0x27: ret 59 // ';'
+    if sc == 0x28: ret 39 // '\''
+    if sc == 0x29: ret 96 // '`'
+    if sc == 0x2B: ret 92 // '\'
+    if sc == 0x33: ret 44 // ','
+    if sc == 0x34: ret 46 // '.'
+    if sc == 0x35: ret 47 // '/'
+    if sc == 0x10: ret 113 // q
+    if sc == 0x11: ret 119 // w
+    if sc == 0x12: ret 101 // e
+    if sc == 0x13: ret 114 // r
+    if sc == 0x14: ret 116 // t
+    if sc == 0x15: ret 121 // y
+    if sc == 0x16: ret 117 // u
+    if sc == 0x17: ret 105 // i
+    if sc == 0x18: ret 111 // o
+    if sc == 0x19: ret 112 // p
+    if sc == 0x1E: ret 97  // a
+    if sc == 0x1F: ret 115 // s
+    if sc == 0x20: ret 100 // d
+    if sc == 0x21: ret 102 // f
+    if sc == 0x22: ret 103 // g
+    if sc == 0x23: ret 104 // h
+    if sc == 0x24: ret 106 // j
+    if sc == 0x25: ret 107 // k
+    if sc == 0x26: ret 108 // l
+    if sc == 0x2C: ret 122 // z
+    if sc == 0x2D: ret 120 // x
+    if sc == 0x2E: ret 99  // c
+    if sc == 0x2F: ret 118 // v
+    if sc == 0x30: ret 98  // b
+    if sc == 0x31: ret 110 // n
+    if sc == 0x32: ret 109 // m
+  if sc == 0x39: ret 32 // space
+  if sc == 0x0E: ret 8  // backspace
+  if sc == 0x0F: ret 9  // tab
+  if sc == 0x1C: ret 10 // enter
+  ret 0
+
+// ─── Internal helpers ────────────────────────────────────────────
+
+fn _kbd_wait_write() -> int:
+  timeout:int = 100000
+  while timeout > 0:
+    s:int = sys.sys_inb(KBD_STATUS_PORT)
+    if (s & 2) == 0: ret 0
+    timeout = timeout - 1
+  ret (0 - 1)
+
+fn _kbd_wait_read() -> int:
+  timeout:int = 100000
+  while timeout > 0:
+    s:int = sys.sys_inb(KBD_STATUS_PORT)
+    if (s & 1) != 0: ret 0
+    timeout = timeout - 1
+  ret (0 - 1)
+
+fn _kbd_send_cmd(cmd:int) -> int:
+  _kbd_wait_write()
+  sys.sys_outb(KBD_DATA_PORT, cmd)
+  ret 0
+
+fn _update_leds() -> int:
+  _kbd_send_cmd(KBD_CMD_SET_LEDS)
+  _kbd_wait_write()
+  sys.sys_outb(KBD_DATA_PORT, g_leds & 7)
+  ret 0
+
+fn _buf_push(ev:*KeyEvent) -> int:
+  next_tail:int = (g_kbuf_tail + 1) % KBD_BUF_SIZE
+  if next_tail == g_kbuf_head: ret (0 - 1)  // buffer full
+  unsafe:
+    g_kbuf[g_kbuf_tail].keycode   = (*ev).keycode
+    g_kbuf[g_kbuf_tail].modifiers = (*ev).modifiers
+    g_kbuf[g_kbuf_tail].pressed   = (*ev).pressed
+    g_kbuf[g_kbuf_tail].raw_scan  = (*ev).raw_scan
+  g_kbuf_tail = next_tail
+  ret 0
+
+fn _buf_pop(ev:*KeyEvent) -> int:
+  if g_kbuf_head == g_kbuf_tail: ret (0 - 1)  // buffer empty
+  unsafe:
+    (*ev).keycode   = g_kbuf[g_kbuf_head].keycode
+    (*ev).modifiers = g_kbuf[g_kbuf_head].modifiers
+    (*ev).pressed   = g_kbuf[g_kbuf_head].pressed
+    (*ev).raw_scan  = g_kbuf[g_kbuf_head].raw_scan
+  g_kbuf_head = (g_kbuf_head + 1) % KBD_BUF_SIZE
+  ret 0
+
+// ─── Scancode decoder ────────────────────────────────────────────
+
+fn _decode_scancode(scan:int) -> int:
+  // E0 prefix for extended keys (must check raw scan before bitmasking)
+  if scan == 0xE0:
+    g_extended = 1
+    ret 0
+
+  released:int = (scan & 0x80) != 0
+  sc:int = scan & 0x7F
+
+  ev:KeyEvent
+  ev.raw_scan  = scan
+  ev.pressed   = released == 0
+  ev.modifiers = g_modifiers
+  ev.keycode   = KEY_NONE
+
+  // Extended scancodes (E0 prefix already consumed)
+  if g_extended != 0:
+    g_extended = 0
+    // Map extended codes
+    if sc == 0x48: ev.keycode = KEY_UP
+    else if sc == 0x50: ev.keycode = KEY_DOWN
+    else if sc == 0x4B: ev.keycode = KEY_LEFT
+    else if sc == 0x4D: ev.keycode = KEY_RIGHT
+    else if sc == 0x47: ev.keycode = KEY_HOME
+    else if sc == 0x4F: ev.keycode = KEY_END
+    else if sc == 0x49: ev.keycode = KEY_PGUP
+    else if sc == 0x51: ev.keycode = KEY_PGDN
+    else if sc == 0x52: ev.keycode = KEY_INS
+    else if sc == 0x53: ev.keycode = KEY_DEL
+    else if sc == 0x5B: ev.keycode = KEY_LGUI
+    else if sc == 0x5C: ev.keycode = KEY_RGUI
+    else if sc == 0x1D:
+      if released == 0: g_modifiers = g_modifiers | MOD_CTRL
+      else:             g_modifiers = g_modifiers & (MOD_CTRL ^ 0xFFFFFFFF)
+      ret 0
+    else if sc == 0x38:
+      if released == 0: g_modifiers = g_modifiers | MOD_ALTGR
+      else:             g_modifiers = g_modifiers & (MOD_ALTGR ^ 0xFFFFFFFF)
+      ret 0
+    ev.modifiers = g_modifiers
+    unsafe: _buf_push(&ev)
+    ret 0
+
+
+  // Modifier keys
+  if sc == 0x2A || sc == 0x36:  // L/R Shift
+    if released == 0: g_modifiers = g_modifiers | MOD_SHIFT
+    else:             g_modifiers = g_modifiers & (MOD_SHIFT ^ 0xFFFFFFFF)
+    ret 0
+  if sc == 0x1D:  // Ctrl
+    if released == 0: g_modifiers = g_modifiers | MOD_CTRL
+    else:             g_modifiers = g_modifiers & (MOD_CTRL ^ 0xFFFFFFFF)
+    ret 0
+  if sc == 0x38:  // Alt
+    if released == 0: g_modifiers = g_modifiers | MOD_ALT
+    else:             g_modifiers = g_modifiers & (MOD_ALT ^ 0xFFFFFFFF)
+    ret 0
+
+  // Toggle keys (on press only)
+  if released == 0:
+    if sc == 0x3A:  // CapsLock
+      g_modifiers = g_modifiers ^ MOD_CAPSLOCK
+      if (g_modifiers & MOD_CAPSLOCK) != 0: g_leds = g_leds | 4
+      else:                                  g_leds = g_leds & 3
+      _update_leds()
+      ret 0
+    if sc == 0x45:  // NumLock
+      g_modifiers = g_modifiers ^ MOD_NUMLOCK
+      if (g_modifiers & MOD_NUMLOCK) != 0: g_leds = g_leds | 2
+      else:                                 g_leds = g_leds & 5
+      _update_leds()
+      ret 0
+    if sc == 0x46:  // ScrollLock
+      g_modifiers = g_modifiers ^ MOD_SCROLLLOCK
+      if (g_modifiers & MOD_SCROLLLOCK) != 0: g_leds = g_leds | 1
+      else:                                    g_leds = g_leds & 6
+      _update_leds()
+      ret 0
+
+  // Function keys
+  if sc == 0x3B: ev.keycode = KEY_F1
+  else if sc == 0x3C: ev.keycode = KEY_F2
+  else if sc == 0x3D: ev.keycode = KEY_F3
+  else if sc == 0x3E: ev.keycode = KEY_F4
+  else if sc == 0x3F: ev.keycode = KEY_F5
+  else if sc == 0x40: ev.keycode = KEY_F6
+  else if sc == 0x41: ev.keycode = KEY_F7
+  else if sc == 0x42: ev.keycode = KEY_F8
+  else if sc == 0x43: ev.keycode = KEY_F9
+  else if sc == 0x44: ev.keycode = KEY_F10
+  else if sc == 0x57: ev.keycode = KEY_F11
+  else if sc == 0x58: ev.keycode = KEY_F12
+  else if sc == 0x01: ev.keycode = KEY_ESC
+  else if sc == 0x0E: ev.keycode = KEY_BACKSPACE
+  else if sc == 0x0F: ev.keycode = KEY_TAB
+  else if sc == 0x1C: ev.keycode = KEY_ENTER
+  else if sc < 89:
+    // Normal character — apply shift/caps
+    use_shift:int = (g_modifiers & MOD_SHIFT) != 0
+    caps:int = (g_modifiers & MOD_CAPSLOCK) != 0
+    ch:int = _sc_to_ascii(sc, use_shift)
+    // CapsLock flips case for alpha chars
+    if caps != 0 && ch >= 97 && ch <= 122: ch = ch - 32
+    if caps != 0 && ch >= 65 && ch <= 90:  ch = ch + 32
+    ev.keycode = ch
+
+  ev.modifiers = g_modifiers
+  unsafe: _buf_push(&ev)
+  ret 0
+
+// ─── IRQ1 handler (called from IDT dispatcher) ──────────────────
+
+fn irq_handler() -> int:
+  scan:int = sys.sys_inb(KBD_DATA_PORT)
+  _decode_scancode(scan)
+  // Send EOI to PIC
+  sys.sys_outb(0x20, 0x20)
+  ret 0
+
+// ─── Public API ─────────────────────────────────────────────────
+
+fn init() -> int:
+  g_modifiers = 0
+  g_extended  = 0
+  g_leds      = MOD_NUMLOCK  // NumLock on by default
+  g_kbuf_head = 0
+  g_kbuf_tail = 0
+  // Enable scanning
+  _kbd_send_cmd(KBD_CMD_ENABLE_SCANNING)
+  _update_leds()
+  g_inited = 1
+  ret 0
+
+fn poll() -> int:
+  // 1. Check PS/2 keyboard controller
+  st:int = sys.sys_inb(KBD_STATUS_PORT)
+  if (st & 1) != 0:
+    if (st & 0x20) == 0:
+      scan:int = sys.sys_inb(KBD_DATA_PORT)
+      _decode_scancode(scan)
+      ret 1
+
+  // 2. Check serial COM1 port
+  if serial.has_char() != 0:
+    ch:int = serial.getc()
+    if ch >= 0:
+      ev:KeyEvent
+      ev.pressed = 1
+      ev.modifiers = 0
+      if ch == 13 || ch == 10:
+        ev.keycode = KEY_ENTER
+      else if ch == 8 || ch == 127:
+        ev.keycode = KEY_BACKSPACE
+      else if ch == 9:
+        ev.keycode = KEY_TAB
+      else if ch == 27:
+        ev.keycode = KEY_ESC
+      else if ch == 3:
+        ev.keycode = 99
+        ev.modifiers = MOD_CTRL
+      else if ch == 12:
+        ev.keycode = 108
+        ev.modifiers = MOD_CTRL
+      else if ch == 4:
+        ev.keycode = 100
+        ev.modifiers = MOD_CTRL
+      else:
+        ev.keycode = ch
+      unsafe: _buf_push(&ev)
+      ret 1
+  ret 0
+
+fn has_event() -> int:
+  poll()
+  ret g_kbuf_head != g_kbuf_tail
+
+fn read_event(ev:*KeyEvent) -> int:
+  ret _buf_pop(ev)
+
+// Blocking read — waits until a printable key-press event arrives
+fn getc() -> int:
+  ev:KeyEvent
+  while 1:
+    if has_event() != 0:
+      unsafe:
+        if _buf_pop(&ev) == 0:
+          if ev.pressed != 0 && ev.keycode > 0:
+            ret ev.keycode
+  ret 0
+
+fn get_modifiers() -> int:
+  ret g_modifiers
+
+fn caps_lock() -> int:
+  ret (g_modifiers & MOD_CAPSLOCK) != 0
+
+fn num_lock() -> int:
+  ret (g_modifiers & MOD_NUMLOCK) != 0

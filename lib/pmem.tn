@@ -1,0 +1,226 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — Physical Memory Manager (lib/pmem.tn)
+// ═══════════════════════════════════════════════════════════════
+//
+//  Bitmap-based physical page allocator seeded from Limine memmap.
+//  - Each bit in the bitmap = 1 physical 4KiB page
+//  - 1 = free, 0 = used
+//  - Reserves: first 4MB (kernel + VGA), MMIO holes, kernel image
+// ═══════════════════════════════════════════════════════════════
+
+let PAGE_SIZE:int        = 4096
+let BITMAP_MAX_PAGES:int = 262144  // covers 1024MB @ 4K/page
+
+static let g_bitmap:[int;4096]     // 4096 ints * 64 bits = 262144 pages max
+static let g_total_pages:int = 0
+static let g_free_pages:int  = 0
+static let g_first_free:int  = 0
+static let g_inited:int      = 0
+
+static let g_installed_ram_mb:int = 0
+static let g_usable_ram_mb:int    = 0
+static let g_reserved_ram_mb:int  = 0
+
+// ─── Bitmap ops ─────────────────────────────────────────────────
+
+fn _bit_set(page:int) -> int:
+  if page < 0 || page >= BITMAP_MAX_PAGES: ret 0
+  word:int = page / 64
+  bit:int  = page % 64
+  unsafe: g_bitmap[word] = g_bitmap[word] | (1 << bit)
+  ret 0
+
+fn _bit_clear(page:int) -> int:
+  if page < 0 || page >= BITMAP_MAX_PAGES: ret 0
+  word:int = page / 64
+  bit:int  = page % 64
+  unsafe: g_bitmap[word] = g_bitmap[word] & ((1 << bit) ^ 0xFFFFFFFFFFFFFFFF)
+  ret 0
+
+fn _bit_test(page:int) -> int:
+  if page < 0 || page >= BITMAP_MAX_PAGES: ret 0
+  word:int = page / 64
+  bit:int  = page % 64
+  unsafe: ret (g_bitmap[word] >> bit) & 1
+  ret 0
+
+// ─── Limine memmap entry ────────────────────────────────────────
+
+let MEMMAP_USABLE:int                  = 0
+let MEMMAP_RESERVED:int                = 1
+let MEMMAP_ACPI_RECLAIMABLE:int        = 2
+let MEMMAP_ACPI_NVS:int                = 3
+let MEMMAP_BAD_MEMORY:int              = 4
+let MEMMAP_BOOTLOADER_RECLAIMABLE:int  = 5
+let MEMMAP_KERNEL_AND_MODULES:int      = 6
+let MEMMAP_FRAMEBUFFER:int             = 7
+
+struct MemMapEntry:
+  base:int
+  length:int
+  kind:int
+
+fn init(memmap_base:int, memmap_count:int) -> int:
+  // Clear bitmap
+  i:int = 0
+  while i < 4096:
+    unsafe: g_bitmap[i] = 0
+    i = i + 1
+
+  installed_bytes:int = 0
+  usable_bytes:int    = 0
+  reserved_bytes:int  = 0
+  g_free_pages        = 0
+
+  e:int = 0
+  if memmap_base != 0 && memmap_count > 0:
+    entries_ptrs:*int = memmap_base as *int
+    while e < memmap_count:
+      entry_addr:int = 0
+      unsafe: entry_addr = entries_ptrs[e]
+      if entry_addr != 0:
+        entry:*MemMapEntry = entry_addr as *MemMapEntry
+        base:int = (*entry).base
+        len:int  = (*entry).length
+        kind:int = (*entry).kind
+
+        // Track installed physical RAM vs reserved/MMIO regions
+        if kind == MEMMAP_USABLE || kind == MEMMAP_BOOTLOADER_RECLAIMABLE || kind == MEMMAP_KERNEL_AND_MODULES || kind == MEMMAP_ACPI_RECLAIMABLE || kind == MEMMAP_FRAMEBUFFER:
+          installed_bytes = installed_bytes + len
+        else:
+          reserved_bytes = reserved_bytes + len
+
+        if kind == MEMMAP_USABLE:
+          usable_bytes = usable_bytes + len
+          pbase:int = (base + PAGE_SIZE - 1) / PAGE_SIZE
+          pend:int  = (base + len) / PAGE_SIZE
+          j:int = pbase
+          while j < pend:
+            if j < BITMAP_MAX_PAGES:
+              _bit_set(j)
+              g_free_pages = g_free_pages + 1
+            j = j + 1
+      e = e + 1
+
+  g_installed_ram_mb = (installed_bytes + 1048575) / (1024 * 1024)
+  g_usable_ram_mb    = (usable_bytes + 1048575) / (1024 * 1024)
+  g_reserved_ram_mb  = (reserved_bytes + 1048575) / (1024 * 1024)
+
+  // Fallback if memmap didn't supply usable pages
+  if g_free_pages == 0:
+    g_installed_ram_mb = 512
+    g_usable_ram_mb    = 508
+    g_reserved_ram_mb  = 4
+    fb:int = 1024
+    while fb < 131072:
+      _bit_set(fb)
+      g_free_pages = g_free_pages + 1
+      fb = fb + 1
+
+  if g_installed_ram_mb <= 0:
+    g_installed_ram_mb = 512
+
+  g_total_pages = g_installed_ram_mb * 256
+
+  // Reserve page 0 (null pointer protection)
+  _bit_clear(0)
+
+  // Reserve first 4MB (kernel image, VGA buffer, low DMA)
+  j:int = 1
+  while j < 1024:
+    if _bit_test(j) != 0:
+      _bit_clear(j)
+      g_free_pages = g_free_pages - 1
+    j = j + 1
+
+  g_first_free = 1024
+  g_inited = 1
+  ret 0
+
+fn alloc() -> int:
+  if g_free_pages <= 0: ret (0 - 1)
+  i:int = g_first_free
+  while i < BITMAP_MAX_PAGES && i < g_total_pages:
+    if _bit_test(i) != 0:
+      _bit_clear(i)
+      g_free_pages = g_free_pages - 1
+      if i == g_first_free: g_first_free = i + 1
+      ret i * PAGE_SIZE
+    i = i + 1
+  ret (0 - 1)
+
+fn alloc_n(n:int) -> int:
+  if n <= 0: ret (0 - 1)
+  i:int = g_first_free
+  while i + n <= BITMAP_MAX_PAGES && i + n <= g_total_pages:
+    all_free:int = 1
+    j:int = 0
+    while j < n:
+      if _bit_test(i + j) == 0:
+        all_free = 0
+        i = i + j + 1
+        break
+      j = j + 1
+    if all_free != 0:
+      k:int = 0
+      while k < n:
+        _bit_clear(i + k)
+        g_free_pages = g_free_pages - 1
+        k = k + 1
+      if i == g_first_free: g_first_free = i + n
+      ret i * PAGE_SIZE
+  ret (0 - 1)
+
+fn free_frame(addr:int) -> int:
+  page:int = addr / PAGE_SIZE
+  if page <= 0 || page >= BITMAP_MAX_PAGES: ret (0 - 1)
+  _bit_set(page)
+  g_free_pages = g_free_pages + 1
+  if page < g_first_free: g_first_free = page
+  ret 0
+
+fn free_n(addr:int, n:int) -> int:
+  i:int = 0
+  while i < n:
+    free_frame(addr + i * PAGE_SIZE)
+    i = i + 1
+  ret 0
+
+fn reserve(addr:int, size:int) -> int:
+  pstart:int = addr / PAGE_SIZE
+  pend:int   = (addr + size + PAGE_SIZE - 1) / PAGE_SIZE
+  i:int = pstart
+  while i < pend && i < BITMAP_MAX_PAGES:
+    if _bit_test(i) != 0:
+      _bit_clear(i)
+      g_free_pages = g_free_pages - 1
+    i = i + 1
+  ret 0
+
+fn free_pages() -> int: ret g_free_pages
+fn total_pages() -> int: ret g_total_pages
+
+fn total_mb() -> int:
+  if g_installed_ram_mb > 0: ret g_installed_ram_mb
+  ret 512
+
+fn free_mb() -> int:
+  f:int = (g_free_pages * PAGE_SIZE) / (1024 * 1024)
+  ret f
+
+fn used_mb() -> int:
+  tot:int = total_mb()
+  fre:int = free_mb()
+  u:int = tot - fre
+  if u <= 0: ret 1
+  ret u
+
+fn used_kb() -> int:
+  tot_kb:int = total_mb() * 1024
+  fre_kb:int = (g_free_pages * PAGE_SIZE) / 1024
+  u_kb:int = tot_kb - fre_kb
+  if u_kb <= 0: ret 4096
+  ret u_kb
+
+fn usable_mb() -> int: ret g_usable_ram_mb
+fn reserved_mb() -> int: ret g_reserved_ram_mb

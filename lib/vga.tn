@@ -1,0 +1,428 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — VGA Text Mode Driver (drivers/vga.tn)
+// ═══════════════════════════════════════════════════════════════
+//
+//  80×25 text console at physical 0xB8000
+//  Each cell: [char_byte][attr_byte]
+//    attr_byte = (bg << 4) | fg   (4-bit each)
+//
+//  Features:
+//   - 16 foreground + 8 background colors
+//   - Hardware blinking cursor (CRTC port 0x3D4/0x3D5)
+//   - Scrolling when bottom is reached
+//   - print(), print_int(), print_hex(), set_color(), clear()
+//   - Inverse video / highlight for shell prompts
+// ═══════════════════════════════════════════════════════════════
+
+import "sys"
+import "fb"
+import "serial"
+
+// VGA text buffer base address (physical, identity-mapped)
+let VGA_ADDR:int  = 0xB8000
+let VGA_COLS:int  = 80
+let VGA_ROWS:int  = 25
+let VGA_SIZE:int  = 80 * 25  // 2000 cells
+
+// ─── Color constants ────────────────────────────────────────────
+
+let COLOR_BLACK:int         = 0
+let COLOR_BLUE:int          = 1
+let COLOR_GREEN:int         = 2
+let COLOR_CYAN:int          = 3
+let COLOR_RED:int           = 4
+let COLOR_MAGENTA:int       = 5
+let COLOR_BROWN:int         = 6
+let COLOR_LIGHT_GREY:int    = 7
+let COLOR_DARK_GREY:int     = 8
+let COLOR_LIGHT_BLUE:int    = 9
+let COLOR_LIGHT_GREEN:int   = 10
+let COLOR_LIGHT_CYAN:int    = 11
+let COLOR_LIGHT_RED:int     = 12
+let COLOR_LIGHT_MAGENTA:int = 13
+let COLOR_YELLOW:int        = 14
+let COLOR_WHITE:int         = 15
+
+// CRTC register ports
+let VGA_CRTC_ADDR:int = 0x3D4
+let VGA_CRTC_DATA:int = 0x3D5
+let VGA_CRTC_CURSOR_HI:int = 14
+let VGA_CRTC_CURSOR_LO:int = 15
+let VGA_CRTC_CURSOR_START:int = 10
+let VGA_CRTC_CURSOR_END:int   = 11
+
+// ─── State ──────────────────────────────────────────────────────
+
+static let g_row:int  = 0
+static let g_col:int  = 0
+static let g_attr:int = 0x07   // default: light grey on black
+static let g_inited:int = 0
+static let g_vga_base:int = 0xB8000
+static let g_use_fb:int = 0
+
+fn init_fb(addr:int, width:int, height:int, pitch:int, bpp:int) -> int:
+  g_use_fb = 1
+  ret fb.init(addr, width, height, pitch, bpp)
+
+fn is_fb() -> int: ret g_use_fb
+fn cols() -> int:
+  if g_use_fb != 0: ret fb.cols()
+  ret VGA_COLS
+fn rows() -> int:
+  if g_use_fb != 0: ret fb.rows()
+  ret VGA_ROWS
+
+fn set_scale(s:int) -> int:
+  if g_use_fb != 0: ret fb.set_scale(s)
+  ret 0
+
+fn scale() -> int:
+  if g_use_fb != 0: ret fb.scale()
+  ret 1
+
+fn set_base(base:int) -> int:
+  g_vga_base = base
+  ret 0
+
+// Tab width
+let VGA_TAB:int = 4
+
+// ─── Internal helpers ───────────────────────────────────────────
+
+fn _cell_offset(row:int, col:int) -> int:
+  ret (row * VGA_COLS + col) * 2
+
+fn _write_cell(row:int, col:int, ch:int, attr:int) -> int:
+  off:int = _cell_offset(row, col)
+  unsafe:
+    buf:*char = g_vga_base as *char
+    buf[off]     = ch as char
+    buf[off + 1] = attr as char
+  ret 0
+
+fn _read_char(row:int, col:int) -> int:
+  off:int = _cell_offset(row, col)
+  unsafe:
+    buf:*char = g_vga_base as *char
+    ret buf[off] as int
+  ret 0
+
+fn _read_attr(row:int, col:int) -> int:
+  off:int = _cell_offset(row, col)
+  unsafe:
+    buf:*char = g_vga_base as *char
+    ret buf[off + 1] as int
+  ret 0
+
+// ─── Cursor control ─────────────────────────────────────────────
+
+fn _cursor_move(row:int, col:int) -> int:
+  pos:int = row * VGA_COLS + col
+  sys.sys_outb(VGA_CRTC_ADDR, VGA_CRTC_CURSOR_HI)
+  sys.sys_outb(VGA_CRTC_DATA, (pos >> 8) & 0xFF)
+  sys.sys_outb(VGA_CRTC_ADDR, VGA_CRTC_CURSOR_LO)
+  sys.sys_outb(VGA_CRTC_DATA, pos & 0xFF)
+  ret 0
+
+fn cursor_enable() -> int:
+  // Underline cursor: scan lines 13–15
+  sys.sys_outb(VGA_CRTC_ADDR, VGA_CRTC_CURSOR_START)
+  sys.sys_outb(VGA_CRTC_DATA, 13)
+  sys.sys_outb(VGA_CRTC_ADDR, VGA_CRTC_CURSOR_END)
+  sys.sys_outb(VGA_CRTC_DATA, 15)
+  ret 0
+
+fn cursor_disable() -> int:
+  sys.sys_outb(VGA_CRTC_ADDR, VGA_CRTC_CURSOR_START)
+  sys.sys_outb(VGA_CRTC_DATA, 0x20)  // bit 5 set = cursor off
+  ret 0
+
+fn cursor_set(row:int, col:int) -> int:
+  g_row = row
+  g_col = col
+  if g_use_fb != 0: ret fb.cursor_set(row, col)
+  _cursor_move(row, col)
+  ret 0
+
+fn cursor_row() -> int:
+  if g_use_fb != 0: ret fb.cursor_row()
+  ret g_row
+
+fn cursor_col() -> int:
+  if g_use_fb != 0: ret fb.cursor_col()
+  ret g_col
+
+fn cursor_show() -> int:
+  if g_use_fb != 0: ret fb.cursor_show()
+  cursor_enable()
+  ret 0
+
+fn cursor_hide() -> int:
+  if g_use_fb != 0: ret fb.cursor_hide()
+  cursor_disable()
+  ret 0
+
+fn cursor_update() -> int:
+  if g_use_fb != 0: ret fb.cursor_update()
+  ret 0
+
+// ─── Scroll ─────────────────────────────────────────────────────
+
+fn scroll() -> int:
+  if g_use_fb != 0: ret fb.scroll()
+  unsafe:
+    buf:*char = g_vga_base as *char
+    row:int = 1
+    while row < VGA_ROWS:
+      col:int = 0
+      while col < VGA_COLS:
+        src:int = _cell_offset(row, col)
+        dst:int = _cell_offset(row - 1, col)
+        buf[dst]     = buf[src]
+        buf[dst + 1] = buf[src + 1]
+        col = col + 1
+      row = row + 1
+  // Clear last row
+  col:int = 0
+  while col < VGA_COLS:
+    _write_cell(VGA_ROWS - 1, col, 32, g_attr)  // space
+    col = col + 1
+  g_row = VGA_ROWS - 1
+  ret 0
+
+// ─── Public API ─────────────────────────────────────────────────
+
+fn init() -> int:
+  g_row   = 0
+  g_col   = 0
+  g_attr  = make_attr(COLOR_LIGHT_GREY, COLOR_BLACK)
+  g_inited = 1
+  if g_use_fb == 0:
+    cursor_enable()
+    _cursor_move(0, 0)
+  ret 0
+
+fn make_attr(fg:int, bg:int) -> int:
+  ret ((bg & 0x07) << 4) | (fg & 0x0F)
+
+fn set_color(fg:int, bg:int) -> int:
+  g_attr = make_attr(fg, bg)
+  if g_use_fb != 0: fb.set_color(fg, bg)
+  ret 0
+
+fn get_fg() -> int:
+  if g_use_fb != 0: ret fb.get_fg()
+  ret g_attr & 0x0F
+
+fn get_bg() -> int:
+  if g_use_fb != 0: ret fb.get_bg()
+  ret (g_attr >> 4) & 0x07
+
+fn clear() -> int:
+  if g_use_fb != 0: ret fb.clear()
+  row:int = 0
+  while row < VGA_ROWS:
+    col:int = 0
+    while col < VGA_COLS:
+      _write_cell(row, col, 32, g_attr)
+      col = col + 1
+    row = row + 1
+  g_row = 0
+  g_col = 0
+  _cursor_move(0, 0)
+  ret 0
+
+fn clear_row(row:int) -> int:
+  if g_use_fb != 0: ret fb.clear_row(row)
+  col:int = 0
+  while col < VGA_COLS:
+    _write_cell(row, col, 32, g_attr)
+    col = col + 1
+  ret 0
+
+fn putc(ch:int) -> int:
+  serial.putc(ch)
+  if g_use_fb != 0: ret fb.putc(ch)
+
+  if ch == 10:   // '\n'
+    g_col = 0
+    g_row = g_row + 1
+    if g_row >= VGA_ROWS: scroll()
+  else if ch == 13: // '\r'
+    g_col = 0
+  else if ch == 8:  // '\b' backspace
+    if g_col > 0:
+      g_col = g_col - 1
+    else if g_row > 0:
+      g_row = g_row - 1
+      g_col = VGA_COLS - 1
+    _write_cell(g_row, g_col, 32, g_attr)
+  else if ch == 9:  // '\t' tab
+    spaces:int = VGA_TAB - (g_col % VGA_TAB)
+    i:int = 0
+    while i < spaces:
+      putc(32)
+      i = i + 1
+    ret 0
+  else:
+    _write_cell(g_row, g_col, ch, g_attr)
+    g_col = g_col + 1
+    if g_col >= VGA_COLS:
+      g_col = 0
+      g_row = g_row + 1
+      if g_row >= VGA_ROWS: scroll()
+  _cursor_move(g_row, g_col)
+  ret 0
+
+fn putc_at(row:int, col:int, ch:int, attr:int) -> int:
+  if g_use_fb != 0: ret fb.draw_char_at(col, row, ch, attr & 0x0F, (attr >> 4) & 0x07)
+  _write_cell(row, col, ch, attr)
+  ret 0
+
+fn print(s:str) -> int:
+  if s == 0: ret 0
+  serial.print(s)
+  if g_use_fb != 0: ret fb.print(s)
+  unsafe:
+    p:*char = s as *char
+    i:int = 0
+    while p[i] != 0 as char:
+      putc(p[i] as int)
+      i = i + 1
+  ret 0
+
+fn print_at(row:int, col:int, s:str, attr:int) -> int:
+  if s == 0: ret 0
+  saved_attr:int = g_attr
+  saved_row:int  = g_row
+  saved_col:int  = g_col
+  g_attr = attr
+  g_row  = row
+  g_col  = col
+  print(s)
+  g_attr = saved_attr
+  g_row  = saved_row
+  g_col  = saved_col
+  ret 0
+
+fn print_centered(row:int, s:str, attr:int) -> int:
+  // Count string length
+  n:int = 0
+  unsafe:
+    p:*char = s as *char
+    while p[n] != 0 as char: n = n + 1
+    col:int = (VGA_COLS - n) / 2
+    if col < 0: col = 0
+    print_at(row, col, s, attr)
+  ret 0
+
+// Integer output
+fn print_int(n:int) -> int:
+  if n < 0:
+    putc(45)  // '-'
+    n = 0 - n
+  if n == 0:
+    putc(48)  // '0'
+    ret 0
+  // Extract digits (reverse order)
+  digits:[int;20]
+  count:int = 0
+  tmp:int = n
+  while tmp > 0:
+    digits[count] = tmp % 10
+    tmp = tmp / 10
+    count = count + 1
+  i:int = count - 1
+  while i >= 0:
+    putc(48 + digits[i])
+    i = i - 1
+  ret 0
+
+// Hex output (padded to 'width' digits, '0x' prefix)
+fn print_hex(n:int, width:int) -> int:
+  putc(48)   // '0'
+  putc(120)  // 'x'
+  hex_chars:str = "0123456789ABCDEF"
+  shift:int = (width - 1) * 4
+  i:int = 0
+  unsafe:
+    hc:*char = hex_chars as *char
+    while i < width:
+      putc(hc[(n >> shift) & 0xF] as int)
+      shift = shift - 4
+      i = i + 1
+  ret 0
+
+// Print a horizontal line of 'ch' characters
+fn print_hline(ch:int, len:int) -> int:
+  i:int = 0
+  while i < len:
+    putc(ch)
+    i = i + 1
+  ret 0
+
+// Highlight a row (inverse video selection)
+fn highlight_row(row:int, fg:int, bg:int) -> int:
+  attr:int = make_attr(fg, bg)
+  col:int = 0
+  while col < VGA_COLS:
+    ch:int = _read_char(row, col)
+    _write_cell(row, col, ch, attr)
+    col = col + 1
+  ret 0
+
+// Print with a given color, restore afterward
+fn print_colored(s:str, fg:int, bg:int) -> int:
+  saved:int = g_attr
+  set_color(fg, bg)
+  print(s)
+  g_attr = saved
+  ret 0
+
+// Status bar: fill the bottom row with a colored string
+fn status_bar(msg:str, fg:int, bg:int) -> int:
+  saved_row:int = g_row
+  saved_col:int = g_col
+  saved_attr:int = g_attr
+  g_row  = VGA_ROWS - 1
+  g_col  = 0
+  g_attr = make_attr(fg, bg)
+  clear_row(VGA_ROWS - 1)
+  print(msg)
+  g_attr = saved_attr
+  g_row  = saved_row
+  g_col  = saved_col
+  _cursor_move(g_row, g_col)
+  ret 0
+
+// ─── Scrolling & Scrollbar Delegation ────────────────────────────
+
+fn scroll_view(delta:int) -> int:
+  if g_use_fb != 0: ret fb.scroll_view(delta)
+  ret 0
+
+fn get_scroll_offset() -> int:
+  if g_use_fb != 0: ret fb.get_scroll_offset()
+  ret 0
+
+fn scroll_to_bottom() -> int:
+  if g_use_fb != 0: ret fb.scroll_to_bottom()
+  ret 0
+
+fn page_up() -> int:
+  if g_use_fb != 0: ret fb.page_up()
+  ret 0
+
+fn page_down() -> int:
+  if g_use_fb != 0: ret fb.page_down()
+  ret 0
+
+fn handle_scrollbar_click(mx:int, my:int) -> int:
+  if g_use_fb != 0: ret fb.handle_scrollbar_click(mx, my)
+  ret 0
+
+fn scrollbar_release() -> int:
+  if g_use_fb != 0: ret fb.scrollbar_release()
+  ret 0
+
+

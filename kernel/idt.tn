@@ -1,0 +1,55 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — IDT & IRQ Routing (kernel/idt.tn)
+// ═══════════════════════════════════════════════════════════════
+
+import "../drivers/keyboard"
+import "../drivers/mouse"
+import "../drivers/vga"
+import "./pic"
+import "./pit"
+
+fn get_exc_name(vec:int) -> str:
+  if vec == 0: ret "Division by Zero"
+  if vec == 1: ret "Debug"
+  if vec == 2: ret "Non-Maskable Interrupt"
+  if vec == 3: ret "Breakpoint"
+  if vec == 4: ret "Overflow"
+  if vec == 5: ret "Bound Range Exceeded"
+  if vec == 6: ret "Invalid Opcode"
+  if vec == 7: ret "Device Not Available"
+  if vec == 8: ret "Double Fault"
+  if vec == 9: ret "Coprocessor Segment Overrun"
+  if vec == 10: ret "Invalid TSS"
+  if vec == 11: ret "Segment Not Present"
+  if vec == 12: ret "Stack-Segment Fault"
+  if vec == 13: ret "General Protection Fault"
+  if vec == 14: ret "Page Fault"
+  if vec == 15: ret "Reserved"
+  if vec == 16: ret "x87 FPU Exception"
+  if vec == 17: ret "Alignment Check"
+  if vec == 18: ret "Machine Check"
+  if vec == 19: ret "SIMD Floating-Point Exception"
+  ret "Unknown Exception"
+
+fn _exception_handler(vec:int) -> int:
+  vga.set_color(vga.COLOR_WHITE, vga.COLOR_RED)
+  vga.print("\n\n *** CPU EXCEPTION #")
+  vga.print_int(vec)
+  vga.print(" ")
+  vga.print(get_exc_name(vec))
+  vga.print(" ***\n Halting.\n")
+  while 1: 1
+  ret 0
+
+fn handle_irq(irq:int) -> int:
+  if irq == 0:
+    pit.tick()
+  else if irq == 1:
+    keyboard.irq_handler()
+  else if irq == 12:
+    mouse.irq_handler()
+  pic.eoi(irq)
+  ret 0
+
+fn init() -> int:
+  ret 0

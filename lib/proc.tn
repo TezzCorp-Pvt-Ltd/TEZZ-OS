@@ -1,0 +1,17 @@
+// ═══════════════════════════════════════════════════════════════
+// TEZZ-OS — Process Manager (kernel/proc.tn — Phase 1)
+// ═══════════════════════════════════════════════════════════════
+
+struct ProcessEntry:
+  pid:int
+  name:str
+  state:int
+  priority:int
+
+static let g_proc_count:int = 1
+
+fn init() -> int:
+  ret 0
+
+fn count() -> int:
+  ret g_proc_count
